@@ -11,6 +11,7 @@ It uses a global Coin currency to manage the plugin economy.
 Depencency:
 
 Vault - https://www.zrips.net/cmivault/
+
 CoinCard - https://www.spigotmc.org/resources/coin-card.129770/
 
 API - Website to login or register your Coin account. https://bank.foxsrv.net/
