@@ -1,0 +1,36 @@
+name: LandCoin
+version: 1.1
+main: com.foxsrv.landcoin.LandCoin
+api-version: 1.20
+author: FoxOficial2
+description: Simple land claiming plugin with CoinCard integration
+depend: [CoinCard]
+
+commands:
+  land:
+    description: Main land command
+    usage: /land <subcommand>
+    aliases: [l]
+  selection:
+    description: Selection tool command
+    usage: /selection [clear|info|view]
+    aliases: [sel, wand]
+
+permissions:
+  landcoin.*:
+    description: All LandCoin permissions
+    default: op
+    children:
+      landcoin.user: true
+      landcoin.admin: true
+  landcoin.user:
+    description: Basic user permissions
+    default: true
+  landcoin.admin:
+    description: Admin permissions
+    default: op
+    children:
+      landcoin.admin.bypass: true
+  landcoin.admin.bypass:
+    description: Bypass all land protections
+    default: op

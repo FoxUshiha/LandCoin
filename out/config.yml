@@ -1,0 +1,13 @@
+# LandCoin Configuration
+
+ServerCard: "e1301fadfc35"  # Server Coin Card to receive and pay coin for buy and sell lands or collect taxes
+
+LandBuyPrice: 0.00000001  # Price for buying lands from server
+LandSellPrice: 0.00000001  # Price for selling back the lands for the server
+
+LandDailyTax: 0.00000001  # Daily tax for each chunk land you own
+
+TaxPercentForRent: 0.01  # 0.01 = 1%
+TaxForSell: 0.01  # 0.01 = 1%
+
+MaxPaymentAttempts: 10  # Maximum number of payment attempts before failing
