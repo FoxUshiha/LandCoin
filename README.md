@@ -28,69 +28,129 @@ Now you can use the Coin economy globally!
 And this is the plugin commands:
 
 /land
+
 /land claim
+
 /land unclaim
+
 /land area claim <name>
+
 /land area unclaim
+
 /land set <role> <break/place/access/use> <true/false>
+
 /land rent
+
 /land area rent
+
 /land unrent [all/area]
+
 /land rental <price>
+
 /land area rental <price>
+
 /land sell <price>
+
 /land buy
+
 /land info
+
 /land view
+
 /land trust <player> [role]
+
 /land area trust <jogador> [role]
+
 /land untrust <player>
+
 /land area untrust <player>
+
 /land reload
+
 /selection
+
 /selection clear
+
 /selection info
+
 /selection view
+
 /land admin setowner <player>
+
 /land admin unclaim
+
 /land admin set <role> <break/place/access/use> <true/false>
+
 /land admin selection
+
 /land admin nextday
+
 
 
 Peemissions:
 
 landcoin.use
+
 ├── landcoin.claim
+
 ├── landcoin.unclaim
+
 ├── landcoin.area.claim
+
 ├── landcoin.area.unclaim
+
 ├── landcoin.set
+
 ├── landcoin.rent
+
 ├── landcoin.area.rent
+
 ├── landcoin.unrent
+
 ├── landcoin.rental
+
 ├── landcoin.area.rental
+
 ├── landcoin.sell
+
 ├── landcoin.buy
+
 ├── landcoin.info
+
 ├── landcoin.view
+
 ├── landcoin.trust
+
 ├── landcoin.area.trust
+
 ├── landcoin.untrust
+
 ├── landcoin.area.untrust
+
 ├── landcoin.selection
+
 ├── landcoin.selection.clear
+
 ├── landcoin.selection.info
+
 ├── landcoin.selection.view
+
 └── landcoin.admin
+
 ├── landcoin.admin.reload
+
 ├── landcoin.admin.setowner
+
 ├── landcoin.admin.unclaim
+
 ├── landcoin.admin.set
+
 ├── landcoin.admin.selection
+
 ├── landcoin.admin.nextday
+
 └── landcoin.admin.bypass
+
 
 API Host: https://github.com/FoxUshiha/DC-Coin-Bot
 
