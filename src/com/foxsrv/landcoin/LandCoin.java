@@ -75,43 +75,34 @@ public class LandCoin extends JavaPlugin implements Listener {
     public void onEnable() {
         getLogger().info("Starting LandCoin v" + getDescription().getVersion() + "...");
 
-        // Check if CoinCard is installed
         if (!setupCoinCardAPI()) {
             getLogger().severe("CoinCard plugin not found! Disabling LandCoin...");
             getServer().getPluginManager().disablePlugin(this);
             return;
         }
 
-        // Setup Vault for offline player name resolution
         setupVault();
 
-        // Create data folder
         if (!getDataFolder().exists()) {
             getDataFolder().mkdirs();
         }
 
-        // Initialize components
         this.configManager = new ConfigManager(this);
         this.dataManager = new DataManager(this);
         this.landManager = new LandManager(this);
         this.subAreaManager = new SubAreaManager(this);
         this.selectionManager = new SelectionManager(this);
         this.viewManager = new ViewManager(this);
-        this.transactionQueue = new TransactionQueue(this, 1100); // 1100ms cooldown
+        this.transactionQueue = new TransactionQueue(this, 1100);
         this.taxManager = new TaxManager(this);
         this.rentalManager = new RentalManager(this);
 
-        // Load data
         this.dataManager.loadAll();
-
-        // Start timers
         this.taxManager.startTimer();
         this.rentalManager.startTimer();
 
-        // Register events
         getServer().getPluginManager().registerEvents(this, this);
 
-        // Register commands
         registerCommand("land", new LandCommand());
         registerCommand("selection", new SelectionCommand());
 
@@ -206,9 +197,6 @@ public class LandCoin extends JavaPlugin implements Listener {
         return BigDecimal.valueOf(amount).setScale(8, RoundingMode.DOWN).doubleValue();
     }
 
-    // ====================================================
-    // ENUMS FOR TYPE SAFETY
-    // ====================================================
     public enum Role {
         OWNER, ASSIST, TRUST, MEMBER, RENT, BUYER, NONE
     }
@@ -217,289 +205,262 @@ public class LandCoin extends JavaPlugin implements Listener {
         BREAK, PLACE, ACCESS, USE
     }
 
-    // ====================================================
-    // PENDING NOTIFICATION SYSTEM
-    // ====================================================
-public static class PendingNotification implements Serializable {
-    private static final long serialVersionUID = 1L;
-    private final UUID playerId;
-    private final String message;
-    private long timestamp; // Removido 'final' para permitir atribuição na deserialização
-    private final NotificationType type;
-    
-    public enum NotificationType {
-        TAX_LOST, RENTAL_LOST, INFO
-    }
-    
-    public PendingNotification(UUID playerId, String message, NotificationType type) {
-        this.playerId = playerId;
-        this.message = message;
-        this.timestamp = System.currentTimeMillis();
-        this.type = type;
-    }
-    
-    public UUID getPlayerId() { return playerId; }
-    public String getMessage() { return message; }
-    public long getTimestamp() { return timestamp; }
-    public NotificationType getType() { return type; }
-    
-    public void serialize(ObjectOutputStream oos) throws IOException {
-        oos.writeObject(playerId.toString());
-        oos.writeObject(message);
-        oos.writeLong(timestamp);
-        oos.writeObject(type.name());
-    }
-    
-    public static PendingNotification deserialize(ObjectInputStream ois) throws IOException, ClassNotFoundException {
-        UUID playerId = UUID.fromString((String) ois.readObject());
-        String message = (String) ois.readObject();
-        long timestamp = ois.readLong();
-        NotificationType type = NotificationType.valueOf((String) ois.readObject());
+    public static class PendingNotification implements Serializable {
+        private static final long serialVersionUID = 1L;
+        private final UUID playerId;
+        private final String message;
+        private long timestamp;
+        private final NotificationType type;
         
-        PendingNotification notification = new PendingNotification(playerId, message, type);
-        notification.timestamp = timestamp; // Agora funciona porque timestamp não é mais final
-        return notification;
-    }
-}
-
-    // ====================================================
-    // RENTAL MANAGER
-    // ====================================================
-public static class RentalManager {
-    private final LandCoin plugin;
-    private BukkitTask rentalTask;
-    private long lastRentalTime;
-    private final List<PendingNotification> pendingNotifications = new ArrayList<>();
-
-    public RentalManager(LandCoin plugin) {
-        this.plugin = plugin;
-        this.lastRentalTime = System.currentTimeMillis();
-    }
-
-    public void startTimer() {
-        rentalTask = new BukkitRunnable() {
-            @Override
-            public void run() {
-                checkRentals();
-            }
-        }.runTaskTimer(plugin, 1200L, 600L); // Check every 30 seconds
-    }
-
-    public void stopTimer() {
-        if (rentalTask != null) rentalTask.cancel();
-    }
-
-    public void forceProcessNextDay() {
-        lastRentalTime = 0; // Force rental check
-        checkRentals();
+        public enum NotificationType {
+            TAX_LOST, RENTAL_LOST, INFO
+        }
+        
+        public PendingNotification(UUID playerId, String message, NotificationType type) {
+            this.playerId = playerId;
+            this.message = message;
+            this.timestamp = System.currentTimeMillis();
+            this.type = type;
+        }
+        
+        public UUID getPlayerId() { return playerId; }
+        public String getMessage() { return message; }
+        public long getTimestamp() { return timestamp; }
+        public NotificationType getType() { return type; }
+        
+        public void serialize(ObjectOutputStream oos) throws IOException {
+            oos.writeObject(playerId.toString());
+            oos.writeObject(message);
+            oos.writeLong(timestamp);
+            oos.writeObject(type.name());
+        }
+        
+        public static PendingNotification deserialize(ObjectInputStream ois) throws IOException, ClassNotFoundException {
+            UUID playerId = UUID.fromString((String) ois.readObject());
+            String message = (String) ois.readObject();
+            long timestamp = ois.readLong();
+            NotificationType type = NotificationType.valueOf((String) ois.readObject());
+            
+            PendingNotification notification = new PendingNotification(playerId, message, type);
+            notification.timestamp = timestamp;
+            return notification;
+        }
     }
 
-    private void checkRentals() {
-        long now = System.currentTimeMillis();
-        if (now - lastRentalTime < 86400000L) return; // 24 hours
+    public static class RentalManager {
+        private final LandCoin plugin;
+        private BukkitTask rentalTask;
+        private long lastRentalTime;
+        private final List<PendingNotification> pendingNotifications = new ArrayList<>();
 
-        lastRentalTime = now;
-        processRentals();
-    }
-
-    private void processRentals() {
-        String serverCard = plugin.getConfigManager().getServerCard();
-        if (serverCard == null || serverCard.isEmpty()) {
-            plugin.getLogger().warning("Server card not configured, cannot process rentals");
-            return;
+        public RentalManager(LandCoin plugin) {
+            this.plugin = plugin;
+            this.lastRentalTime = System.currentTimeMillis();
         }
 
-        // Process land rentals
-        for (Land land : plugin.getDataManager().getLands()) {
-            UUID renterId = land.getRenter();
-            if (renterId != null) {
-                double price = land.getRentalPrice();
-                double tax = price * plugin.getConfigManager().getTaxPercentForRent();
-                double total = price + tax;
+        public void startTimer() {
+            rentalTask = new BukkitRunnable() {
+                @Override
+                public void run() {
+                    checkRentals();
+                }
+            }.runTaskTimer(plugin, 1200L, 600L);
+        }
 
-                processRentalPayment(renterId, land.getOwner(), land, null, price, tax, total);
+        public void stopTimer() {
+            if (rentalTask != null) rentalTask.cancel();
+        }
+
+        public void forceProcessNextDay() {
+            lastRentalTime = 0;
+            checkRentals();
+        }
+
+        private void checkRentals() {
+            long now = System.currentTimeMillis();
+            if (now - lastRentalTime < 86400000L) return;
+
+            lastRentalTime = now;
+            processRentals();
+        }
+
+        private void processRentals() {
+            String serverCard = plugin.getConfigManager().getServerCard();
+            if (serverCard == null || serverCard.isEmpty()) {
+                plugin.getLogger().warning("Server card not configured, cannot process rentals");
+                return;
+            }
+
+            for (Land land : plugin.getDataManager().getLands()) {
+                UUID renterId = land.getRenter();
+                if (renterId != null) {
+                    double price = land.getRentalPrice();
+                    double tax = price * plugin.getConfigManager().getTaxPercentForRent();
+                    double total = price + tax;
+                    processRentalPayment(renterId, land.getOwner(), land, null, price, tax, total);
+                }
+            }
+
+            for (SubArea area : plugin.getDataManager().getSubAreas()) {
+                UUID renterId = area.getRenter();
+                if (renterId != null) {
+                    UUID ownerId = null;
+                    for (String chunkKey : area.getChunkKeys()) {
+                        Land land = plugin.getDataManager().getLand(chunkKey);
+                        if (land != null) {
+                            ownerId = land.getOwner();
+                            break;
+                        }
+                    }
+                    
+                    if (ownerId == null) continue;
+                    
+                    double price = area.getRentalPrice();
+                    double tax = price * plugin.getConfigManager().getTaxPercentForRent();
+                    double total = price + tax;
+                    processRentalPayment(renterId, ownerId, null, area, price, tax, total);
+                }
             }
         }
 
-        // Process sub-area rentals
-        for (SubArea area : plugin.getDataManager().getSubAreas()) {
-            UUID renterId = area.getRenter();
-            if (renterId != null) {
-                // Find owner from any land in the sub-area
-                UUID ownerId = null;
+        private void processRentalPayment(UUID renterId, UUID ownerId, Land land, SubArea area, 
+                                         double price, double tax, double total) {
+            String renterCard = plugin.getCoinCardAPI().getPlayerCard(renterId);
+            String ownerCard = plugin.getCoinCardAPI().getPlayerCard(ownerId);
+            String serverCard = plugin.getConfigManager().getServerCard();
+
+            if (renterCard == null || ownerCard == null) {
+                removeRental(renterId, land, area, "No card configured");
+                return;
+            }
+
+            plugin.getCoinCardAPI().getBalance(renterCard, new BalanceCallback() {
+                int attempts = 0;
+                
+                @Override
+                public void onResult(double balance, String error) {
+                    if (error != null || balance < total) {
+                        removeRental(renterId, land, area, "Insufficient funds (balance: " + formatCoin(balance) + 
+                                ", needed: " + formatCoin(total) + ")");
+                        return;
+                    }
+
+                    plugin.getTransactionQueue().enqueue(renterCard, ownerCard, price, new TransferCallback() {
+                        @Override
+                        public void onSuccess(String txId, double amount) {
+                            plugin.getTransactionQueue().enqueue(renterCard, serverCard, tax, null);
+
+                            PlayerData data = plugin.getDataManager().getPlayer(renterId);
+                            long expiry = System.currentTimeMillis() + 86400000L;
+                            
+                            if (area != null) {
+                                data.addRentedSubArea(area.getId(), expiry);
+                            } else if (land != null) {
+                                data.addRentedLand(land.getChunkKey(), expiry);
+                            }
+                            
+                            plugin.getDataManager().saveAll();
+
+                            Player renter = Bukkit.getPlayer(renterId);
+                            if (renter != null && renter.isOnline()) {
+                                renter.sendMessage(ChatColor.GREEN + "Your rental has been automatically renewed for another 24 hours!");
+                            }
+                            
+                            Player owner = Bukkit.getPlayer(ownerId);
+                            if (owner != null && owner.isOnline()) {
+                                owner.sendMessage(ChatColor.GREEN + "You received " + formatCoin(price) + 
+                                        " coins from rental (TX: " + txId + ")");
+                            }
+                        }
+
+                        @Override
+                        public void onFailure(String error) {
+                            attempts++;
+                            if (attempts >= plugin.getConfigManager().getMaxPaymentAttempts()) {
+                                removeRental(renterId, land, area, "Payment failed after " + attempts + " attempts");
+                            } else {
+                                plugin.getTransactionQueue().enqueue(renterCard, ownerCard, price, this);
+                            }
+                        }
+                    });
+                }
+            });
+        }
+
+        private void removeRental(UUID renterId, Land land, SubArea area, String reason) {
+            String type = "";
+            String identifier = "";
+            String displayName = "";
+            
+            if (area != null) {
+                area.removeMember(renterId);
+                type = "sub-area";
+                identifier = area.getId();
+                displayName = "Sub-area " + area.getId().substring(0, 8) + "...";
+            } else if (land != null) {
+                land.removeMember(renterId);
+                type = "land";
+                identifier = land.getChunkKey();
+                displayName = "Land at " + land.getWorld() + " " + land.getX() + "," + land.getZ();
+            }
+            
+            PlayerData data = plugin.getDataManager().getPlayer(renterId);
+            if (area != null) {
+                data.removeRentedSubArea(area.getId());
+                data.addRentalLostItem(area.getId());
+            } else if (land != null) {
+                data.removeRentedLand(land.getChunkKey());
+                data.addRentalLostItem(land.getChunkKey());
+            }
+            
+            plugin.getDataManager().saveAll();
+            
+            String message = ChatColor.RED + "Your " + type + " rental has been cancelled: " + reason;
+            
+            PendingNotification notification = new PendingNotification(
+                    renterId, message, PendingNotification.NotificationType.RENTAL_LOST);
+            pendingNotifications.add(notification);
+            
+            Player renter = Bukkit.getPlayer(renterId);
+            if (renter != null && renter.isOnline()) {
+                renter.sendMessage(message);
+                renter.sendMessage(ChatColor.YELLOW + "The " + displayName + " is now available for others to rent.");
+                pendingNotifications.removeIf(n -> n.getPlayerId().equals(renterId) && n.getMessage().equals(message));
+            }
+            
+            if (land != null) {
+                Player owner = Bukkit.getPlayer(land.getOwner());
+                if (owner != null && owner.isOnline()) {
+                    owner.sendMessage(ChatColor.YELLOW + "Your land at " + land.getWorld() + " " + land.getX() + "," + land.getZ() + 
+                            " is now available for rent again.");
+                }
+            } else if (area != null) {
                 for (String chunkKey : area.getChunkKeys()) {
-                    Land land = plugin.getDataManager().getLand(chunkKey);
-                    if (land != null) {
-                        ownerId = land.getOwner();
+                    Land l = plugin.getDataManager().getLand(chunkKey);
+                    if (l != null) {
+                        Player owner = Bukkit.getPlayer(l.getOwner());
+                        if (owner != null && owner.isOnline()) {
+                            owner.sendMessage(ChatColor.YELLOW + "Your sub-area is now available for rent again.");
+                        }
                         break;
                     }
                 }
-                
-                if (ownerId == null) continue;
-                
-                double price = area.getRentalPrice();
-                double tax = price * plugin.getConfigManager().getTaxPercentForRent();
-                double total = price + tax;
-
-                processRentalPayment(renterId, ownerId, null, area, price, tax, total);
             }
-        }
-    }
-
-    private void processRentalPayment(UUID renterId, UUID ownerId, Land land, SubArea area, 
-                                     double price, double tax, double total) {
-        String renterCard = plugin.getCoinCardAPI().getPlayerCard(renterId);
-        String ownerCard = plugin.getCoinCardAPI().getPlayerCard(ownerId);
-        String serverCard = plugin.getConfigManager().getServerCard();
-
-        if (renterCard == null || ownerCard == null) {
-            // No card - remove rental immediately
-            removeRental(renterId, land, area, "No card configured");
-            return;
-        }
-
-        plugin.getCoinCardAPI().getBalance(renterCard, new BalanceCallback() {
-            int attempts = 0;
             
-            @Override
-            public void onResult(double balance, String error) {
-                if (error != null || balance < total) {
-                    // Insufficient balance - remove rental immediately on first failure
-                    removeRental(renterId, land, area, "Insufficient funds (balance: " + formatCoin(balance) + 
-                            ", needed: " + formatCoin(total) + ")");
-                    return;
-                }
+            plugin.getLogger().info("Rental removed for " + renterId + ": " + displayName + " - " + reason);
+        }
 
-                // Pay owner
-                plugin.getTransactionQueue().enqueue(renterCard, ownerCard, price, new TransferCallback() {
-                    @Override
-                    public void onSuccess(String txId, double amount) {
-                        // Pay tax to server
-                        plugin.getTransactionQueue().enqueue(renterCard, serverCard, tax, null);
-
-                        // Update expiry in PlayerData
-                        PlayerData data = plugin.getDataManager().getPlayer(renterId);
-                        long expiry = System.currentTimeMillis() + 86400000L;
-                        
-                        if (area != null) {
-                            data.addRentedSubArea(area.getId(), expiry);
-                        } else if (land != null) {
-                            data.addRentedLand(land.getChunkKey(), expiry);
-                        }
-                        
-                        plugin.getDataManager().saveAll();
-
-                        // Notify if online
-                        Player renter = Bukkit.getPlayer(renterId);
-                        if (renter != null && renter.isOnline()) {
-                            renter.sendMessage(ChatColor.GREEN + "Your rental has been automatically renewed for another 24 hours!");
-                        }
-                        
-                        Player owner = Bukkit.getPlayer(ownerId);
-                        if (owner != null && owner.isOnline()) {
-                            owner.sendMessage(ChatColor.GREEN + "You received " + formatCoin(price) + 
-                                    " coins from rental (TX: " + txId + ")");
-                        }
-                    }
-
-                    @Override
-                    public void onFailure(String error) {
-                        attempts++;
-                        if (attempts >= plugin.getConfigManager().getMaxPaymentAttempts()) {
-                            removeRental(renterId, land, area, "Payment failed after " + attempts + " attempts");
-                        } else {
-                            // Re-queue for another attempt
-                            plugin.getTransactionQueue().enqueue(renterCard, ownerCard, price, this);
-                        }
-                    }
-                });
-            }
-        });
-    }
-
-    private void removeRental(UUID renterId, Land land, SubArea area, String reason) {
-        String type = "";
-        String identifier = "";
-        String displayName = "";
-        
-        if (area != null) {
-            area.removeMember(renterId);
-            type = "sub-area";
-            identifier = area.getId();
-            displayName = "Sub-area " + area.getId().substring(0, 8) + "...";
-        } else if (land != null) {
-            land.removeMember(renterId);
-            type = "land";
-            identifier = land.getChunkKey();
-            displayName = "Land at " + land.getWorld() + " " + land.getX() + "," + land.getZ();
+        public List<PendingNotification> getPendingNotifications(UUID playerId) {
+            return pendingNotifications.stream()
+                    .filter(n -> n.getPlayerId().equals(playerId))
+                    .collect(Collectors.toList());
         }
         
-        PlayerData data = plugin.getDataManager().getPlayer(renterId);
-        if (area != null) {
-            data.removeRentedSubArea(area.getId());
-            data.addRentalLostItem(area.getId());
-        } else if (land != null) {
-            data.removeRentedLand(land.getChunkKey());
-            data.addRentalLostItem(land.getChunkKey());
+        public void clearPendingNotifications(UUID playerId) {
+            pendingNotifications.removeIf(n -> n.getPlayerId().equals(playerId));
         }
-        
-        plugin.getDataManager().saveAll();
-        
-        // Create notification message
-        String message = ChatColor.RED + "Your " + type + " rental has been cancelled: " + reason;
-        
-        // Add to pending notifications for offline players
-        PendingNotification notification = new PendingNotification(
-                renterId, message, PendingNotification.NotificationType.RENTAL_LOST);
-        pendingNotifications.add(notification);
-        
-        // Try to notify if online immediately
-        Player renter = Bukkit.getPlayer(renterId);
-        if (renter != null && renter.isOnline()) {
-            renter.sendMessage(message);
-            renter.sendMessage(ChatColor.YELLOW + "The " + displayName + " is now available for others to rent.");
-            // Remove from pending if online
-            pendingNotifications.removeIf(n -> n.getPlayerId().equals(renterId) && n.getMessage().equals(message));
-        }
-        
-        // Notify land owner if online
-        if (land != null) {
-            Player owner = Bukkit.getPlayer(land.getOwner());
-            if (owner != null && owner.isOnline()) {
-                owner.sendMessage(ChatColor.YELLOW + "Your land at " + land.getWorld() + " " + land.getX() + "," + land.getZ() + 
-                        " is now available for rent again.");
-            }
-        } else if (area != null) {
-            // Find owner for sub-area
-            for (String chunkKey : area.getChunkKeys()) {
-                Land l = plugin.getDataManager().getLand(chunkKey);
-                if (l != null) {
-                    Player owner = Bukkit.getPlayer(l.getOwner());
-                    if (owner != null && owner.isOnline()) {
-                        owner.sendMessage(ChatColor.YELLOW + "Your sub-area is now available for rent again.");
-                    }
-                    break;
-                }
-            }
-        }
-        
-        plugin.getLogger().info("Rental removed for " + renterId + ": " + displayName + " - " + reason);
     }
 
-    public List<PendingNotification> getPendingNotifications(UUID playerId) {
-        return pendingNotifications.stream()
-                .filter(n -> n.getPlayerId().equals(playerId))
-                .collect(Collectors.toList());
-    }
-    
-    public void clearPendingNotifications(UUID playerId) {
-        pendingNotifications.removeIf(n -> n.getPlayerId().equals(playerId));
-    }
-}
-
-    // ====================================================
-    // CONFIG MANAGER
-    // ====================================================
     public static class ConfigManager {
         private final LandCoin plugin;
         private File configFile;
@@ -543,9 +504,6 @@ public static class RentalManager {
         public int getMaxPaymentAttempts() { return maxPaymentAttempts; }
     }
 
-    // ====================================================
-    // DATA MANAGER
-    // ====================================================
     public static class DataManager {
         private final LandCoin plugin;
         private final Map<String, Land> lands = new ConcurrentHashMap<>();
@@ -619,7 +577,6 @@ public static class RentalManager {
         public void removeLand(String chunkKey) { 
             Land land = lands.remove(chunkKey);
             if (land != null) {
-                // Remove all sub-areas in this land
                 for (SubArea area : land.getSubAreas().values()) {
                     subAreas.remove(area.getId());
                 }
@@ -637,9 +594,6 @@ public static class RentalManager {
         }
     }
 
-    // ====================================================
-    // PLAYER DATA
-    // ====================================================
     public static class PlayerData implements Serializable {
         private static final long serialVersionUID = 1L;
         private final UUID uuid;
@@ -749,7 +703,6 @@ public static class RentalManager {
             rentedLands.entrySet().removeIf(e -> e.getValue() <= now);
             rentedSubAreas.entrySet().removeIf(e -> e.getValue() <= now);
             
-            // Remove trusted players for expired rentals
             Set<String> expired = new HashSet<>();
             for (Map.Entry<String, Long> e : rentedLands.entrySet()) {
                 if (e.getValue() <= now) expired.add(e.getKey());
@@ -866,20 +819,15 @@ public static class RentalManager {
                     data.rentalLostItems.add((String) ois.readObject());
                 }
             } catch (EOFException e) {
-                // No lost items saved, that's fine
             }
             
             return data;
         }
     }
 
-    // ====================================================
-    // PERMISSIONS CLASS
-    // ====================================================
     public static class Permissions implements Serializable {
         private static final long serialVersionUID = 1L;
         
-        // Land permissions (for roles)
         private boolean ownerBlockBreak = true;
         private boolean ownerBlockPlace = true;
         private boolean ownerAccess = true;
@@ -1068,9 +1016,6 @@ public static class RentalManager {
         }
     }
 
-    // ====================================================
-    // LAND CLASS (Chunk-based)
-    // ====================================================
     public static class Land implements Serializable {
         private static final long serialVersionUID = 1L;
         private transient LandCoin plugin;
@@ -1081,7 +1026,7 @@ public static class RentalManager {
         private double rentalPrice;
         private final Map<String, SubArea> subAreas = new HashMap<>();
         private final Permissions permissions;
-        private final Map<UUID, Role> memberRoles = new ConcurrentHashMap<>(); // UUID -> role
+        private final Map<UUID, Role> memberRoles = new ConcurrentHashMap<>();
 
         public Land(LandCoin plugin, World world, int x, int z, UUID owner) {
             this.plugin = plugin;
@@ -1240,9 +1185,6 @@ public static class RentalManager {
         }
     }
 
-    // ====================================================
-    // SUBAREA CLASS
-    // ====================================================
     public static class SubArea implements Serializable {
         private static final long serialVersionUID = 1L;
         private final String id;
@@ -1251,7 +1193,7 @@ public static class RentalManager {
         private final Set<String> chunkKeys = new HashSet<>();
         private double rentalPrice;
         private final Permissions permissions;
-        private final Map<UUID, Role> memberRoles = new ConcurrentHashMap<>(); // UUID -> role
+        private final Map<UUID, Role> memberRoles = new ConcurrentHashMap<>();
         private final Map<UUID, Long> lastEntryTimes = new ConcurrentHashMap<>();
 
         public SubArea(String id, World world, Location pos1, Location pos2) {
@@ -1266,7 +1208,6 @@ public static class RentalManager {
             this.rentalPrice = -1;
             this.permissions = new Permissions();
             
-            // Calculate all chunks this sub-area spans
             int minChunkX = minX >> 4;
             int maxChunkX = maxX >> 4;
             int minChunkZ = minZ >> 4;
@@ -1335,7 +1276,7 @@ public static class RentalManager {
         
         public boolean shouldNotifyEntry(UUID playerId) {
             Long lastEntry = lastEntryTimes.get(playerId);
-            return lastEntry == null || (System.currentTimeMillis() - lastEntry) > 5000; // 5 seconds cooldown
+            return lastEntry == null || (System.currentTimeMillis() - lastEntry) > 5000;
         }
 
         public void serialize(ObjectOutputStream oos) throws IOException {
@@ -1411,16 +1352,12 @@ public static class RentalManager {
                     area.lastEntryTimes.put(uuid, time);
                 }
             } catch (EOFException e) {
-                // No entry times saved, that's fine
             }
             
             return area;
         }
     }
 
-    // ====================================================
-    // LAND MANAGER
-    // ====================================================
     public static class LandManager {
         private final LandCoin plugin;
 
@@ -1443,7 +1380,6 @@ public static class RentalManager {
             Land land = getLandAt(loc);
             if (land == null) return true;
 
-            // Check sub-area first (sub-area permissions override land permissions)
             SubArea area = land.getSubAreaAt(loc);
             if (area != null) {
                 Role role = area.getRole(player.getUniqueId());
@@ -1452,7 +1388,6 @@ public static class RentalManager {
                 }
             }
 
-            // Check land permissions
             Role role = land.getRole(player.getUniqueId());
             if (role != Role.NONE) {
                 return land.getPermissions().canBreak(role);
@@ -1530,13 +1465,17 @@ public static class RentalManager {
         public boolean claimLand(Player player, SelectionManager.Selection sel) {
             if (!sel.isValid()) return false;
 
-            // Check if any chunk is already claimed
+            List<String> chunksToClaim = new ArrayList<>();
             for (String chunkKey : sel.getChunks()) {
                 Land existing = plugin.getDataManager().getLand(chunkKey);
-                if (existing != null) {
-                    player.sendMessage(ChatColor.RED + "Some chunks are already claimed!");
-                    return false;
+                if (existing == null) {
+                    chunksToClaim.add(chunkKey);
                 }
+            }
+
+            if (chunksToClaim.isEmpty()) {
+                player.sendMessage(ChatColor.RED + "All chunks in selection are already claimed!");
+                return false;
             }
 
             String serverCard = plugin.getConfigManager().getServerCard();
@@ -1545,7 +1484,7 @@ public static class RentalManager {
                 return false;
             }
 
-            double totalCost = sel.getChunkCount() * plugin.getConfigManager().getLandBuyPrice();
+            double totalCost = chunksToClaim.size() * plugin.getConfigManager().getLandBuyPrice();
             String playerCard = plugin.getCoinCardAPI().getPlayerCard(player.getUniqueId());
 
             if (playerCard == null) {
@@ -1553,7 +1492,6 @@ public static class RentalManager {
                 return false;
             }
 
-            // Check balance
             plugin.getCoinCardAPI().getBalance(playerCard, new BalanceCallback() {
                 @Override
                 public void onResult(double balance, String error) {
@@ -1568,26 +1506,23 @@ public static class RentalManager {
                         return;
                     }
 
-                    // Pay to server
                     plugin.getTransactionQueue().enqueue(playerCard, serverCard, totalCost, new TransferCallback() {
                         @Override
                         public void onSuccess(String txId, double amount) {
-                            for (String chunkKey : sel.getChunks()) {
-                                if (plugin.getDataManager().getLand(chunkKey) == null) {
-                                    String[] parts = chunkKey.split(",");
-                                    World w = Bukkit.getWorld(parts[0]);
-                                    if (w == null) {
-                                        plugin.getLogger().warning("World not loaded: " + parts[0]);
-                                        continue;
-                                    }
-                                    int x = Integer.parseInt(parts[1]);
-                                    int z = Integer.parseInt(parts[2]);
-                                    Land land = new Land(plugin, w, x, z, player.getUniqueId());
-                                    plugin.getDataManager().addLand(land);
+                            for (String chunkKey : chunksToClaim) {
+                                String[] parts = chunkKey.split(",");
+                                World w = Bukkit.getWorld(parts[0]);
+                                if (w == null) {
+                                    plugin.getLogger().warning("World not loaded: " + parts[0]);
+                                    continue;
                                 }
+                                int x = Integer.parseInt(parts[1]);
+                                int z = Integer.parseInt(parts[2]);
+                                Land land = new Land(plugin, w, x, z, player.getUniqueId());
+                                plugin.getDataManager().addLand(land);
                             }
                             plugin.getDataManager().saveAll();
-                            player.sendMessage(ChatColor.GREEN + "Claimed " + sel.getChunkCount() +
+                            player.sendMessage(ChatColor.GREEN + "Claimed " + chunksToClaim.size() +
                                     " chunks for " + formatCoin(totalCost) + " coins (TX: " + txId + ")");
                         }
 
@@ -1636,7 +1571,6 @@ public static class RentalManager {
             final double finalTotalRefund = totalRefund;
             final List<String> finalToRemove = toRemove;
 
-            // Server pays refund
             plugin.getTransactionQueue().enqueue(serverCard, playerCard, totalRefund, new TransferCallback() {
                 @Override
                 public void onSuccess(String txId, double amount) {
@@ -1691,7 +1625,6 @@ public static class RentalManager {
             final BigDecimal finalTotalPrice = totalPrice;
             final Map<String, Land> finalToBuy = toBuy;
 
-            // Check balance
             plugin.getCoinCardAPI().getBalance(playerCard, new BalanceCallback() {
                 @Override
                 public void onResult(double balance, String error) {
@@ -1705,11 +1638,9 @@ public static class RentalManager {
                         return;
                     }
 
-                    // Process each land purchase
                     for (Map.Entry<String, Land> entry : finalToBuy.entrySet()) {
                         Land land = entry.getValue();
                         
-                        // Temporarily remove from sale to prevent race conditions
                         double originalPrice = land.getForSalePrice();
                         land.setForSale(-1);
                         plugin.getDataManager().saveAll();
@@ -1719,14 +1650,11 @@ public static class RentalManager {
                                 BigDecimal.valueOf(plugin.getConfigManager().getTaxForSell()));
                         BigDecimal sellerAmount = BigDecimal.valueOf(originalPrice).subtract(tax);
 
-                        // Pay seller
                         plugin.getTransactionQueue().enqueue(playerCard, sellerCard, sellerAmount.doubleValue(), new TransferCallback() {
                             @Override
                             public void onSuccess(String txId, double amount) {
-                                // Pay tax to server
                                 plugin.getTransactionQueue().enqueue(playerCard, serverCard, tax.doubleValue(), null);
 
-                                // Transfer ownership
                                 land.setOwner(player.getUniqueId());
                                 land.clearForSale();
                                 plugin.getDataManager().saveAll();
@@ -1737,7 +1665,6 @@ public static class RentalManager {
 
                             @Override
                             public void onFailure(String error) {
-                                // Restore sale price on failure
                                 land.setForSale(originalPrice);
                                 plugin.getDataManager().saveAll();
                                 player.sendMessage(ChatColor.RED + "Purchase failed: " + error);
@@ -1788,7 +1715,6 @@ public static class RentalManager {
                 return false;
             }
 
-            // Check if already rented
             if (land.hasRenter()) {
                 player.sendMessage(ChatColor.RED + "This land is already rented!");
                 return false;
@@ -1826,15 +1752,12 @@ public static class RentalManager {
                     final UUID ownerId = land.getOwner();
                     String ownerCard = plugin.getCoinCardAPI().getPlayerCard(ownerId);
 
-                    // Pay owner
                     plugin.getTransactionQueue().enqueue(playerCard, ownerCard, price, new TransferCallback() {
                         @Override
                         public void onSuccess(String txId, double amount) {
-                            // Pay tax to server
                             plugin.getTransactionQueue().enqueue(playerCard, serverCard, tax, null);
 
-                            // Set player as RENTER in this land with expiry
-                            long expiry = System.currentTimeMillis() + 86400000L; // 24 hours
+                            long expiry = System.currentTimeMillis() + 86400000L;
                             land.setRole(player.getUniqueId(), Role.RENT);
                             
                             PlayerData data = plugin.getDataManager().getPlayer(player.getUniqueId());
@@ -1904,9 +1827,6 @@ public static class RentalManager {
         }
     }
 
-    // ====================================================
-    // SUBAREA MANAGER
-    // ====================================================
     public static class SubAreaManager {
         private final LandCoin plugin;
 
@@ -1922,7 +1842,6 @@ public static class RentalManager {
         public boolean claimSubArea(Player player, SelectionManager.Selection sel) {
             if (!sel.isValid()) return false;
 
-            // Check if all lands in selection belong to the same owner
             UUID owner = null;
             for (String chunkKey : sel.getChunks()) {
                 Land land = plugin.getDataManager().getLand(chunkKey);
@@ -1948,7 +1867,6 @@ public static class RentalManager {
                 return false;
             }
 
-            // Check if overlaps with existing sub-areas
             for (String chunkKey : sel.getChunks()) {
                 Land land = plugin.getDataManager().getLand(chunkKey);
                 for (SubArea area : land.getSubAreas().values()) {
@@ -1962,7 +1880,6 @@ public static class RentalManager {
             String id = UUID.randomUUID().toString();
             SubArea area = new SubArea(id, sel.getPos1().getWorld(), sel.getPos1(), sel.getPos2());
             
-            // Add sub-area to all affected lands
             for (String chunkKey : sel.getChunks()) {
                 Land land = plugin.getDataManager().getLand(chunkKey);
                 land.addSubArea(area);
@@ -1976,7 +1893,6 @@ public static class RentalManager {
         }
 
         public void unclaimSubArea(Player player, SubArea area) {
-            // Check if player owns all lands containing this sub-area
             for (String chunkKey : area.getChunkKeys()) {
                 Land land = plugin.getDataManager().getLand(chunkKey);
                 if (land == null || (!land.getOwner().equals(player.getUniqueId()) && !player.hasPermission("landcoin.admin"))) {
@@ -1985,7 +1901,6 @@ public static class RentalManager {
                 }
             }
 
-            // Remove from all lands
             for (String chunkKey : area.getChunkKeys()) {
                 Land land = plugin.getDataManager().getLand(chunkKey);
                 if (land != null) {
@@ -2003,7 +1918,6 @@ public static class RentalManager {
                 return;
             }
             
-            // Check if player owns all lands
             for (String chunkKey : area.getChunkKeys()) {
                 Land land = plugin.getDataManager().getLand(chunkKey);
                 if (land == null || (!land.getOwner().equals(player.getUniqueId()) && !player.hasPermission("landcoin.admin"))) {
@@ -2023,13 +1937,11 @@ public static class RentalManager {
                 return false;
             }
 
-            // Check if already rented
             if (area.hasRenter()) {
                 player.sendMessage(ChatColor.RED + "This sub-area is already rented!");
                 return false;
             }
 
-            // Check if all lands belong to the same owner
             UUID owner = null;
             for (String chunkKey : area.getChunkKeys()) {
                 Land land = plugin.getDataManager().getLand(chunkKey);
@@ -2080,15 +1992,12 @@ public static class RentalManager {
 
                     String ownerCard = plugin.getCoinCardAPI().getPlayerCard(finalOwner);
 
-                    // Pay owner
                     plugin.getTransactionQueue().enqueue(playerCard, ownerCard, price, new TransferCallback() {
                         @Override
                         public void onSuccess(String txId, double amount) {
-                            // Pay tax to server
                             plugin.getTransactionQueue().enqueue(playerCard, serverCard, tax, null);
 
-                            // Set player as RENTER in this sub-area with expiry
-                            long expiry = System.currentTimeMillis() + 86400000L; // 24 hours
+                            long expiry = System.currentTimeMillis() + 86400000L;
                             area.setRole(player.getUniqueId(), Role.RENT);
 
                             PlayerData data = plugin.getDataManager().getPlayer(player.getUniqueId());
@@ -2123,7 +2032,6 @@ public static class RentalManager {
         }
 
         public void trustSubArea(Player player, SubArea area, Player target, Role role) {
-            // Check if player owns all lands
             for (String chunkKey : area.getChunkKeys()) {
                 Land land = plugin.getDataManager().getLand(chunkKey);
                 if (land == null || (!land.getOwner().equals(player.getUniqueId()) && !player.hasPermission("landcoin.admin"))) {
@@ -2147,7 +2055,6 @@ public static class RentalManager {
         }
 
         public void untrustSubArea(Player player, SubArea area, Player target) {
-            // Check if player owns all lands
             for (String chunkKey : area.getChunkKeys()) {
                 Land land = plugin.getDataManager().getLand(chunkKey);
                 if (land == null || (!land.getOwner().equals(player.getUniqueId()) && !player.hasPermission("landcoin.admin"))) {
@@ -2166,9 +2073,6 @@ public static class RentalManager {
         }
     }
 
-    // ====================================================
-    // SELECTION MANAGER
-    // ====================================================
     public static class SelectionManager {
         private final LandCoin plugin;
         private final Map<UUID, Selection> selections = new ConcurrentHashMap<>();
@@ -2225,7 +2129,7 @@ public static class RentalManager {
                 int ticks = 0;
                 @Override
                 public void run() {
-                    if (ticks++ >= 1200) { // 1 minute
+                    if (ticks++ >= 1200) {
                         cancel();
                         viewTasks.remove(playerId);
                         return;
@@ -2239,7 +2143,6 @@ public static class RentalManager {
                         int x = Integer.parseInt(parts[1]);
                         int z = Integer.parseInt(parts[2]);
 
-                        // Optimized: spawn particles only on chunk borders
                         for (int dx = 0; dx < 16; dx++) {
                             spawnBorderParticle(player, w, x, z, dx, 0);
                             spawnBorderParticle(player, w, x, z, dx, 15);
@@ -2300,7 +2203,6 @@ public static class RentalManager {
             public int getChunkCount() { return getChunks().size(); }
 
             public boolean overlaps(SubArea area) {
-                // Simple AABB overlap check
                 int minX1 = Math.min(pos1.getBlockX(), pos2.getBlockX());
                 int maxX1 = Math.max(pos1.getBlockX(), pos2.getBlockX());
                 int minY1 = Math.min(pos1.getBlockY(), pos2.getBlockY());
@@ -2315,9 +2217,6 @@ public static class RentalManager {
         }
     }
 
-    // ====================================================
-    // VIEW MANAGER
-    // ====================================================
     public static class ViewManager {
         private final LandCoin plugin;
         private final Map<UUID, Integer> viewTasks = new HashMap<>();
@@ -2343,7 +2242,6 @@ public static class RentalManager {
                     World world = Bukkit.getWorld(land.getWorld());
                     if (world == null) return;
 
-                    // Optimized: spawn particles only on chunk borders
                     for (int dx = 0; dx < 16; dx++) {
                         spawnBorderParticle(player, world, land.getX(), land.getZ(), dx, 0, particle);
                         spawnBorderParticle(player, world, land.getX(), land.getZ(), dx, 15, particle);
@@ -2383,7 +2281,6 @@ public static class RentalManager {
                         World world = Bukkit.getWorld(land.getWorld());
                         if (world == null) continue;
 
-                        // Optimized: spawn particles only on chunk borders
                         for (int dx = 0; dx < 16; dx++) {
                             spawnBorderParticle(player, world, land.getX(), land.getZ(), dx, 0, particle);
                             spawnBorderParticle(player, world, land.getX(), land.getZ(), dx, 15, particle);
@@ -2406,11 +2303,11 @@ public static class RentalManager {
 
         private Particle getParticleForLand(Land land, Player player) {
             if (land.getOwner() == null) {
-                return Particle.GLOW; // Yellow
+                return Particle.GLOW;
             } else if (land.getOwner().equals(player.getUniqueId())) {
-                return Particle.VILLAGER_HAPPY; // Green
+                return Particle.VILLAGER_HAPPY;
             } else {
-                return Particle.FLAME; // Red
+                return Particle.FLAME;
             }
         }
 
@@ -2429,9 +2326,6 @@ public static class RentalManager {
         }
     }
 
-    // ====================================================
-    // TAX MANAGER
-    // ====================================================
     public static class TaxManager {
         private final LandCoin plugin;
         private BukkitTask taxTask;
@@ -2449,7 +2343,7 @@ public static class RentalManager {
                 public void run() {
                     checkTaxes();
                 }
-            }.runTaskTimer(plugin, 1200L, 600L); // Check every 30 seconds
+            }.runTaskTimer(plugin, 1200L, 600L);
         }
 
         public void stopTimer() {
@@ -2457,14 +2351,14 @@ public static class RentalManager {
         }
 
         public void forceProcessNextDay() {
-            lastTaxTime = 0; // Force tax check
+            lastTaxTime = 0;
             checkTaxes();
-            plugin.getRentalManager().forceProcessNextDay(); // Also force rental processing
+            plugin.getRentalManager().forceProcessNextDay();
         }
 
         private void checkTaxes() {
             long now = System.currentTimeMillis();
-            if (now - lastTaxTime < 86400000L) return; // 24 hours
+            if (now - lastTaxTime < 86400000L) return;
 
             lastTaxTime = now;
             processTaxes();
@@ -2488,14 +2382,12 @@ public static class RentalManager {
                 UUID playerId = entry.getKey();
                 List<Land> lands = entry.getValue();
 
-                // Safe copy of list to avoid issues in callback/async
                 final List<Land> finalLands = new ArrayList<>(lands);
 
                 double totalTax = finalLands.size() * plugin.getConfigManager().getLandDailyTax();
                 String playerCard = plugin.getCoinCardAPI().getPlayerCard(playerId);
 
                 if (playerCard == null) {
-                    // No card - remove all lands safely using copied list
                     for (Land land : finalLands) {
                         plugin.getDataManager().removeLand(land.getChunkKey());
                         PlayerData data = plugin.getDataManager().getPlayer(playerId);
@@ -2503,7 +2395,6 @@ public static class RentalManager {
                     }
                     plugin.getDataManager().saveAll();
                     
-                    // Create notification for offline player
                     String message = ChatColor.RED + "You lost " + finalLands.size() + " lands due to missing card configuration!";
                     PendingNotification notification = new PendingNotification(
                             playerId, message, PendingNotification.NotificationType.TAX_LOST);
@@ -2521,9 +2412,8 @@ public static class RentalManager {
                     @Override
                     public void onResult(double balance, String error) {
                         if (error != null || balance < totalTax) {
-                            // Not enough balance - remove lands until balance can cover remaining taxes
                             List<Land> sorted = new ArrayList<>(finalLands);
-                            sorted.sort((a, b) -> Long.compare(b.hashCode(), a.hashCode())); // Simple sort
+                            sorted.sort((a, b) -> Long.compare(b.hashCode(), a.hashCode()));
 
                             double remainingBalance = balance;
                             List<String> lostLands = new ArrayList<>();
@@ -2557,7 +2447,6 @@ public static class RentalManager {
                             return;
                         }
 
-                        // Pay tax
                         plugin.getTransactionQueue().enqueue(playerCard, serverCard, totalTax, new TransferCallback() {
                             @Override
                             public void onSuccess(String txId, double amount) {
@@ -2566,7 +2455,6 @@ public static class RentalManager {
 
                             @Override
                             public void onFailure(String error) {
-                                // Failed after max attempts - remove lands
                                 plugin.getLogger().warning("Tax collection failed for " + playerId + " after max attempts: " + error);
                                 for (Land land : finalLands) {
                                     plugin.getDataManager().removeLand(land.getChunkKey());
@@ -2604,9 +2492,6 @@ public static class RentalManager {
         }
     }
 
-    // ====================================================
-    // TRANSACTION QUEUE
-    // ====================================================
     public static class TransactionQueue {
         private final LandCoin plugin;
         private final Queue<QueuedTransfer> queue = new ConcurrentLinkedQueue<>();
@@ -2678,11 +2563,10 @@ public static class RentalManager {
 
                         @Override
                         public void onFailure(String error) {
-                            // Requeue on failure
                             attemptCount.put(transfer.id, attempts + 1);
                             queue.add(transfer);
                             TransferCallback callback = callbacks.get(transfer.id);
-                            if (callback != null && attempts % 3 == 0) { // Notify every 3 attempts
+                            if (callback != null && attempts % 3 == 0) {
                                 new BukkitRunnable() {
                                     @Override
                                     public void run() {
@@ -2719,9 +2603,6 @@ public static class RentalManager {
         }
     }
 
-    // ====================================================
-    // LAND COMMAND
-    // ====================================================
     public class LandCommand implements CommandExecutor, TabCompleter {
 
         @Override
@@ -2797,7 +2678,9 @@ public static class RentalManager {
             player.sendMessage(ChatColor.YELLOW + "/land area trust <player> [role] " + ChatColor.GRAY + "- Trust player with role in sub-area");
             player.sendMessage(ChatColor.YELLOW + "/land untrust <player> " + ChatColor.GRAY + "- Remove trust from land");
             player.sendMessage(ChatColor.YELLOW + "/land area untrust <player> " + ChatColor.GRAY + "- Remove trust from sub-area");
-            player.sendMessage(ChatColor.YELLOW + "/land admin ... " + ChatColor.GRAY + "- Admin commands");
+            player.sendMessage(ChatColor.YELLOW + "/land admin setowner <player> " + ChatColor.GRAY + "- Set owner of selected lands");
+            player.sendMessage(ChatColor.YELLOW + "/land admin unclaim " + ChatColor.GRAY + "- Admin unclaim selected lands");
+            player.sendMessage(ChatColor.YELLOW + "/land admin ... " + ChatColor.GRAY + "- Other admin commands");
             player.sendMessage(ChatColor.YELLOW + "/land reload " + ChatColor.GRAY + "- Reload config");
         }
 
@@ -2896,7 +2779,6 @@ public static class RentalManager {
                     }
                     Player target = Bukkit.getPlayer(args[2]);
                     if (target == null) {
-                        // Try offline player
                         OfflinePlayer offline = Bukkit.getOfflinePlayer(args[2]);
                         if (offline.hasPlayedBefore()) {
                             target = offline.getPlayer();
@@ -2906,7 +2788,7 @@ public static class RentalManager {
                         }
                     }
                     
-                    Role role = Role.TRUST; // Default role
+                    Role role = Role.TRUST;
                     if (args.length >= 4) {
                         try {
                             role = Role.valueOf(args[3].toUpperCase());
@@ -2931,7 +2813,6 @@ public static class RentalManager {
                     }
                     target = Bukkit.getPlayer(args[2]);
                     if (target == null) {
-                        // Try offline player
                         OfflinePlayer offline = Bukkit.getOfflinePlayer(args[2]);
                         if (offline.hasPlayedBefore()) {
                             target = offline.getPlayer();
@@ -3001,7 +2882,6 @@ public static class RentalManager {
         private boolean handleUnrent(Player player, String[] args) {
             if (args.length >= 2) {
                 if (args[1].equalsIgnoreCase("all")) {
-                    // Remove from all rented lands and sub-areas
                     for (Land land : dataManager.getLands()) {
                         if (land.getRole(player.getUniqueId()) == Role.RENT) {
                             land.removeMember(player.getUniqueId());
@@ -3139,74 +3019,103 @@ public static class RentalManager {
             return true;
         }
 
-        private boolean handleTrust(Player player, String[] args) {
-            if (args.length < 2) {
-                player.sendMessage(ChatColor.RED + "Usage: /land trust <player> [role]");
-                return true;
-            }
+private boolean handleTrust(Player player, String[] args) {
+    if (args.length < 2) {
+        player.sendMessage(ChatColor.RED + "Usage: /land trust <player> [role]");
+        return true;
+    }
 
-            if (args.length >= 3 && args[1].equalsIgnoreCase("area")) {
-                SubArea area = subAreaManager.getSubAreaAt(player.getLocation());
-                if (area == null) {
-                    player.sendMessage(ChatColor.RED + "You are not in a sub-area!");
-                    return true;
-                }
-                Player target = Bukkit.getPlayer(args[2]);
-                if (target == null) {
-                    // Try offline player
-                    OfflinePlayer offline = Bukkit.getOfflinePlayer(args[2]);
-                    if (offline.hasPlayedBefore()) {
-                        target = offline.getPlayer();
-                    } else {
-                        player.sendMessage(ChatColor.RED + "Player not found!");
-                        return true;
-                    }
-                }
-                
-                Role role = Role.TRUST; // Default role
-                if (args.length >= 4) {
-                    try {
-                        role = Role.valueOf(args[3].toUpperCase());
-                    } catch (IllegalArgumentException e) {
-                        player.sendMessage(ChatColor.RED + "Invalid role! Use ASSIST, TRUST, or MEMBER.");
-                        return true;
-                    }
-                }
-                
-                subAreaManager.trustSubArea(player, area, target, role);
-                return true;
+    // Verifica se é comando para sub-area
+    if (args.length >= 3 && args[1].equalsIgnoreCase("area")) {
+        SubArea area = subAreaManager.getSubAreaAt(player.getLocation());
+        if (area == null) {
+            player.sendMessage(ChatColor.RED + "You are not in a sub-area!");
+            return true;
+        }
+        
+        // Obter UUID do jogador alvo
+        String targetName = args[2];
+        UUID targetUUID = null;
+        
+        Player target = Bukkit.getPlayer(targetName);
+        if (target != null) {
+            targetUUID = target.getUniqueId();
+        } else {
+            OfflinePlayer offline = Bukkit.getOfflinePlayer(targetName);
+            if (offline.hasPlayedBefore()) {
+                targetUUID = offline.getUniqueId();
             } else {
-                Land land = landManager.getLandAt(player.getLocation());
-                if (land == null) {
-                    player.sendMessage(ChatColor.RED + "You are not in a claimed land!");
-                    return true;
-                }
-                Player target = Bukkit.getPlayer(args[1]);
-                if (target == null) {
-                    // Try offline player
-                    OfflinePlayer offline = Bukkit.getOfflinePlayer(args[1]);
-                    if (offline.hasPlayedBefore()) {
-                        target = offline.getPlayer();
-                    } else {
-                        player.sendMessage(ChatColor.RED + "Player not found!");
-                        return true;
-                    }
-                }
-                
-                Role role = Role.TRUST; // Default role
-                if (args.length >= 3) {
-                    try {
-                        role = Role.valueOf(args[2].toUpperCase());
-                    } catch (IllegalArgumentException e) {
-                        player.sendMessage(ChatColor.RED + "Invalid role! Use ASSIST, TRUST, or MEMBER.");
-                        return true;
-                    }
-                }
-                
-                landManager.trustLand(player, land, target, role);
+                player.sendMessage(ChatColor.RED + "Player not found: " + targetName);
                 return true;
             }
         }
+        
+        Role role = Role.TRUST;
+        if (args.length >= 4) {
+            try {
+                role = Role.valueOf(args[3].toUpperCase());
+            } catch (IllegalArgumentException e) {
+                player.sendMessage(ChatColor.RED + "Invalid role! Use ASSIST, TRUST, or MEMBER.");
+                return true;
+            }
+        }
+        
+        // Criar um Player temporário para passar para o método (opcional - pode modificar o método para aceitar UUID)
+        // Como o método trustSubArea espera um Player, vamos criar um "fake" ou modificar o método
+        Player offlinePlayer = Bukkit.getPlayer(targetUUID);
+        if (offlinePlayer == null) {
+            // Se estiver offline, não podemos passar null - precisamos modificar o método
+            player.sendMessage(ChatColor.RED + "Player must be online to trust!");
+            return true;
+        }
+        
+        subAreaManager.trustSubArea(player, area, offlinePlayer, role);
+        return true;
+    } else {
+        Land land = landManager.getLandAt(player.getLocation());
+        if (land == null) {
+            player.sendMessage(ChatColor.RED + "You are not in a claimed land!");
+            return true;
+        }
+        
+        // Obter UUID do jogador alvo
+        String targetName = args[1];
+        UUID targetUUID = null;
+        
+        Player target = Bukkit.getPlayer(targetName);
+        if (target != null) {
+            targetUUID = target.getUniqueId();
+        } else {
+            OfflinePlayer offline = Bukkit.getOfflinePlayer(targetName);
+            if (offline.hasPlayedBefore()) {
+                targetUUID = offline.getUniqueId();
+            } else {
+                player.sendMessage(ChatColor.RED + "Player not found: " + targetName);
+                return true;
+            }
+        }
+        
+        Role role = Role.TRUST;
+        if (args.length >= 3) {
+            try {
+                role = Role.valueOf(args[2].toUpperCase());
+            } catch (IllegalArgumentException e) {
+                player.sendMessage(ChatColor.RED + "Invalid role! Use ASSIST, TRUST, or MEMBER.");
+                return true;
+            }
+        }
+        
+        // Verificar se o jogador está online
+        Player targetPlayer = Bukkit.getPlayer(targetUUID);
+        if (targetPlayer == null) {
+            player.sendMessage(ChatColor.RED + "Player must be online to trust!");
+            return true;
+        }
+        
+        landManager.trustLand(player, land, targetPlayer, role);
+        return true;
+    }
+}
 
         private boolean handleUntrust(Player player, String[] args) {
             if (args.length < 2) {
@@ -3222,7 +3131,6 @@ public static class RentalManager {
                 }
                 Player target = Bukkit.getPlayer(args[2]);
                 if (target == null) {
-                    // Try offline player
                     OfflinePlayer offline = Bukkit.getOfflinePlayer(args[2]);
                     if (offline.hasPlayedBefore()) {
                         target = offline.getPlayer();
@@ -3241,7 +3149,6 @@ public static class RentalManager {
                 }
                 Player target = Bukkit.getPlayer(args[1]);
                 if (target == null) {
-                    // Try offline player
                     OfflinePlayer offline = Bukkit.getOfflinePlayer(args[1]);
                     if (offline.hasPlayedBefore()) {
                         target = offline.getPlayer();
@@ -3255,80 +3162,115 @@ public static class RentalManager {
             }
         }
 
-        private boolean handleAdmin(Player player, String[] args) {
-            if (!player.hasPermission("landcoin.admin")) {
-                player.sendMessage(ChatColor.RED + "No permission!");
+private boolean handleAdmin(Player player, String[] args) {
+    if (!player.hasPermission("landcoin.admin")) {
+        player.sendMessage(ChatColor.RED + "No permission!");
+        return true;
+    }
+
+    if (args.length < 2) {
+        player.sendMessage(ChatColor.RED + "Usage: /land admin <setowner/unclaim/set/selection/nextday>");
+        return true;
+    }
+
+    String sub = args[1].toLowerCase();
+
+    switch (sub) {
+        case "setowner":
+            if (args.length < 3) {
+                player.sendMessage(ChatColor.RED + "Usage: /land admin setowner <player>");
                 return true;
             }
-
-            if (args.length < 2) {
-                player.sendMessage(ChatColor.RED + "Usage: /land admin <setowner/unclaim/set/selection/nextday>");
+            
+            SelectionManager.Selection sel = selectionManager.getSelection(player.getUniqueId());
+            if (!sel.isValid()) {
+                player.sendMessage(ChatColor.RED + "Make a selection first with /selection!");
                 return true;
             }
-
-            String sub = args[1].toLowerCase();
-
-            switch (sub) {
-                case "setowner":
-                    if (args.length < 3) {
-                        player.sendMessage(ChatColor.RED + "Usage: /land admin setowner <player>");
-                        return true;
-                    }
-                    Land land = landManager.getLandAt(player.getLocation());
-                    if (land == null) {
-                        player.sendMessage(ChatColor.RED + "Not in a claimed land!");
-                        return true;
-                    }
-                    Player target = Bukkit.getPlayer(args[2]);
-                    if (target == null) {
-                        // Try offline player
-                        OfflinePlayer offline = Bukkit.getOfflinePlayer(args[2]);
-                        if (offline.hasPlayedBefore()) {
-                            target = offline.getPlayer();
-                        } else {
-                            player.sendMessage(ChatColor.RED + "Player not found!");
-                            return true;
-                        }
-                    }
-                    land.setOwner(target.getUniqueId());
-                    dataManager.saveAll();
-                    player.sendMessage(ChatColor.GREEN + "Land transferred to " + target.getName());
+            
+            // Obter UUID do jogador (online ou offline)
+            UUID targetUUID = null;
+            String targetName = args[2];
+            
+            // Tenta encontrar jogador online
+            Player target = Bukkit.getPlayer(targetName);
+            if (target != null) {
+                targetUUID = target.getUniqueId();
+            } else {
+                // Tenta offline player
+                OfflinePlayer offline = Bukkit.getOfflinePlayer(targetName);
+                if (offline.hasPlayedBefore()) {
+                    targetUUID = offline.getUniqueId();
+                } else {
+                    player.sendMessage(ChatColor.RED + "Player not found: " + targetName);
                     return true;
-
-                case "unclaim":
-                    land = landManager.getLandAt(player.getLocation());
-                    if (land == null) {
-                        player.sendMessage(ChatColor.RED + "Not in a claimed land!");
-                        return true;
-                    }
-                    dataManager.removeLand(land.getChunkKey());
-                    player.sendMessage(ChatColor.GREEN + "Land unclaimed");
-                    return true;
-
-                case "set":
-                    // Similar to /land set but for admin
-                    if (args.length < 5) {
-                        player.sendMessage(ChatColor.RED + "Usage: /land admin set <role> <break/place/access/use> <true/false>");
-                        return true;
-                    }
-                    return handleSet(player, new String[]{"set", args[2], args[3], args[4]});
-
-                case "selection":
-                    // Give selection wand
-                    player.getInventory().addItem(selectionManager.getWandItem());
-                    player.sendMessage(ChatColor.GREEN + "You received the admin selection wand");
-                    return true;
-
-                case "nextday":
-                    taxManager.forceProcessNextDay();
-                    player.sendMessage(ChatColor.GREEN + "Forced next day tax and rental processing");
-                    return true;
-
-                default:
-                    player.sendMessage(ChatColor.RED + "Unknown admin command");
-                    return true;
+                }
             }
-        }
+            
+            int transferred = 0;
+            for (String chunkKey : sel.getChunks()) {
+                Land land = dataManager.getLand(chunkKey);
+                if (land != null) {
+                    land.setOwner(targetUUID);
+                    transferred++;
+                }
+            }
+            
+            if (transferred > 0) {
+                dataManager.saveAll();
+                player.sendMessage(ChatColor.GREEN + "Transferred " + transferred + 
+                        " lands to " + targetName);
+            } else {
+                player.sendMessage(ChatColor.YELLOW + "No lands found in selection to transfer");
+            }
+            return true;
+
+        case "unclaim":
+            sel = selectionManager.getSelection(player.getUniqueId());
+            if (!sel.isValid()) {
+                player.sendMessage(ChatColor.RED + "Make a selection first with /selection!");
+                return true;
+            }
+            
+            int unclaimed = 0;
+            for (String chunkKey : sel.getChunks()) {
+                Land land = dataManager.getLand(chunkKey);
+                if (land != null) {
+                    dataManager.removeLand(chunkKey);
+                    unclaimed++;
+                }
+            }
+            
+            if (unclaimed > 0) {
+                dataManager.saveAll();
+                player.sendMessage(ChatColor.GREEN + "Admin unclaimed " + unclaimed + " lands");
+            } else {
+                player.sendMessage(ChatColor.YELLOW + "No lands found in selection to unclaim");
+            }
+            return true;
+
+        case "set":
+            if (args.length < 5) {
+                player.sendMessage(ChatColor.RED + "Usage: /land admin set <role> <break/place/access/use> <true/false>");
+                return true;
+            }
+            return handleSet(player, new String[]{"set", args[2], args[3], args[4]});
+
+        case "selection":
+            player.getInventory().addItem(selectionManager.getWandItem());
+            player.sendMessage(ChatColor.GREEN + "You received the admin selection wand");
+            return true;
+
+        case "nextday":
+            taxManager.forceProcessNextDay();
+            player.sendMessage(ChatColor.GREEN + "Forced next day tax and rental processing");
+            return true;
+
+        default:
+            player.sendMessage(ChatColor.RED + "Unknown admin command");
+            return true;
+    }
+}
 
         private boolean handleReload(Player player) {
             if (!player.hasPermission("landcoin.admin")) {
@@ -3387,6 +3329,13 @@ public static class RentalManager {
                             .collect(Collectors.toList()));
                     return filter(completions, args[2]);
                 }
+                if (sub.equals("admin")) {
+                    String adminSub = args[1].toLowerCase();
+                    if (adminSub.equals("setowner")) {
+                        completions.addAll(getAllPlayerNames());
+                        return filter(completions, args[2]);
+                    }
+                }
                 if (sub.equals("trust") || sub.equals("untrust")) {
                     if (args[1].equalsIgnoreCase("area")) {
                         completions.addAll(getAllPlayerNames());
@@ -3406,17 +3355,26 @@ public static class RentalManager {
                 }
             }
 
-            if (args.length == 4 && args[0].equalsIgnoreCase("set")) {
-                completions.addAll(Arrays.asList("true", "false"));
-                return filter(completions, args[3]);
-            }
-            
-            if (args.length == 4 && args[0].equalsIgnoreCase("trust")) {
-                completions.addAll(Arrays.stream(Role.values())
-                        .map(Enum::name)
-                        .filter(r -> r.equals("ASSIST") || r.equals("TRUST") || r.equals("MEMBER"))
-                        .collect(Collectors.toList()));
-                return filter(completions, args[3]);
+            if (args.length == 4) {
+                String sub = args[0].toLowerCase();
+                if (sub.equals("set")) {
+                    completions.addAll(Arrays.asList("true", "false"));
+                    return filter(completions, args[3]);
+                }
+                if (sub.equals("trust") && !args[1].equalsIgnoreCase("area")) {
+                    completions.addAll(Arrays.stream(Role.values())
+                            .map(Enum::name)
+                            .filter(r -> r.equals("ASSIST") || r.equals("TRUST") || r.equals("MEMBER"))
+                            .collect(Collectors.toList()));
+                    return filter(completions, args[3]);
+                }
+                if (sub.equals("area") && args[1].equalsIgnoreCase("trust")) {
+                    completions.addAll(Arrays.stream(Role.values())
+                            .map(Enum::name)
+                            .filter(r -> r.equals("ASSIST") || r.equals("TRUST") || r.equals("MEMBER"))
+                            .collect(Collectors.toList()));
+                    return filter(completions, args[3]);
+                }
             }
 
             return Collections.emptyList();
@@ -3438,9 +3396,6 @@ public static class RentalManager {
         }
     }
 
-    // ====================================================
-    // SELECTION COMMAND
-    // ====================================================
     public class SelectionCommand implements CommandExecutor, TabCompleter {
 
         @Override
@@ -3515,10 +3470,6 @@ public static class RentalManager {
         }
     }
 
-    // ====================================================
-    // EVENT LISTENERS
-    // ====================================================
-
     @EventHandler(priority = EventPriority.HIGH)
     public void onBlockBreak(BlockBreakEvent event) {
         Player player = event.getPlayer();
@@ -3542,7 +3493,6 @@ public static class RentalManager {
         Player player = event.getPlayer();
         Block clickedBlock = event.getClickedBlock();
 
-        // Handle selection wand
         ItemStack item = player.getInventory().getItemInMainHand();
         if (item != null && item.isSimilar(selectionManager.getWandItem())) {
             event.setCancelled(true);
@@ -3561,7 +3511,6 @@ public static class RentalManager {
             return;
         }
 
-        // Handle container/interactable access
         if (clickedBlock != null) {
             Location loc = clickedBlock.getLocation();
             Material type = clickedBlock.getType();
@@ -3593,31 +3542,36 @@ public static class RentalManager {
         if (event.getFrom().getBlockX() == event.getTo().getBlockX() &&
             event.getFrom().getBlockY() == event.getTo().getBlockY() &&
             event.getFrom().getBlockZ() == event.getTo().getBlockZ()) {
-            return; // Only rotation, ignore
+            return;
         }
 
         Player player = event.getPlayer();
         
-        // Check chunk entry/exit
         if (!event.getFrom().getChunk().equals(event.getTo().getChunk())) {
             Land fromLand = landManager.getLandAt(event.getFrom());
             Land toLand = landManager.getLandAt(event.getTo());
 
+            UUID fromOwner = (fromLand != null) ? fromLand.getOwner() : null;
+            UUID toOwner = (toLand != null) ? toLand.getOwner() : null;
+
             if (fromLand == null && toLand != null) {
                 player.sendMessage(ChatColor.GREEN + "Entering " +
                         (toLand.getOwner() != null ? Bukkit.getOfflinePlayer(toLand.getOwner()).getName() + "'s land" : "unclaimed land"));
-            } else if (fromLand != null && toLand == null) {
+            }
+            else if (fromLand != null && toLand == null) {
                 player.sendMessage(ChatColor.RED + "Leaving " +
                         (fromLand.getOwner() != null ? Bukkit.getOfflinePlayer(fromLand.getOwner()).getName() + "'s land" : "unclaimed land"));
-            } else if (fromLand != null && toLand != null && !fromLand.getChunkKey().equals(toLand.getChunkKey())) {
-                player.sendMessage(ChatColor.RED + "Leaving " +
-                        (fromLand.getOwner() != null ? Bukkit.getOfflinePlayer(fromLand.getOwner()).getName() + "'s land" : "unclaimed land"));
-                player.sendMessage(ChatColor.GREEN + "Entering " +
-                        (toLand.getOwner() != null ? Bukkit.getOfflinePlayer(toLand.getOwner()).getName() + "'s land" : "unclaimed land"));
+            }
+            else if (fromLand != null && toLand != null) {
+                if (!fromOwner.equals(toOwner)) {
+                    player.sendMessage(ChatColor.RED + "Leaving " +
+                            (fromLand.getOwner() != null ? Bukkit.getOfflinePlayer(fromLand.getOwner()).getName() + "'s land" : "unclaimed land"));
+                    player.sendMessage(ChatColor.GREEN + "Entering " +
+                            (toLand.getOwner() != null ? Bukkit.getOfflinePlayer(toLand.getOwner()).getName() + "'s land" : "unclaimed land"));
+                }
             }
         }
 
-        // Check sub-area entry/exit with notification cooldown
         SubArea fromArea = subAreaManager.getSubAreaAt(event.getFrom());
         SubArea toArea = subAreaManager.getSubAreaAt(event.getTo());
 
@@ -3650,36 +3604,32 @@ public static class RentalManager {
         data.updateName();
         data.clearExpiredRentals();
         
-        // Check for pending tax notifications
         List<PendingNotification> taxNotifications = taxManager.getPendingNotifications(player.getUniqueId());
         for (PendingNotification notification : taxNotifications) {
             player.sendMessage(notification.getMessage());
         }
         taxManager.clearPendingNotifications(player.getUniqueId());
         
-        // Check for pending rental notifications
         List<PendingNotification> rentalNotifications = rentalManager.getPendingNotifications(player.getUniqueId());
         for (PendingNotification notification : rentalNotifications) {
             player.sendMessage(notification.getMessage());
         }
         rentalManager.clearPendingNotifications(player.getUniqueId());
         
-        // Check for expiring rentals
         for (Map.Entry<String, Long> entry : data.getRentedSubAreas().entrySet()) {
             long timeLeft = entry.getValue() - System.currentTimeMillis();
-            if (timeLeft > 0 && timeLeft < 3600000) { // Less than 1 hour
+            if (timeLeft > 0 && timeLeft < 3600000) {
                 player.sendMessage(ChatColor.YELLOW + "Your sub-area rental expires in less than 1 hour!");
             }
         }
         
         for (Map.Entry<String, Long> entry : data.getRentedLands().entrySet()) {
             long timeLeft = entry.getValue() - System.currentTimeMillis();
-            if (timeLeft > 0 && timeLeft < 3600000) { // Less than 1 hour
+            if (timeLeft > 0 && timeLeft < 3600000) {
                 player.sendMessage(ChatColor.YELLOW + "Your land rental expires in less than 1 hour!");
             }
         }
         
-        // Show summary of lost items from PlayerData
         if (!data.getTaxLostLands().isEmpty()) {
             player.sendMessage(ChatColor.RED + "You lost " + data.getTaxLostLands().size() + 
                     " lands due to unpaid taxes while you were offline!");
