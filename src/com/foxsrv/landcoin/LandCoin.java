@@ -10,9 +10,9 @@ import org.bukkit.Chunk;
 import org.bukkit.Location;
 import org.bukkit.Material;
 import org.bukkit.OfflinePlayer;
-import org.bukkit.Particle;
 import org.bukkit.World;
 import org.bukkit.block.Block;
+import org.bukkit.block.Container;
 import org.bukkit.command.*;
 import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.entity.Player;
@@ -66,7 +66,6 @@ public class LandCoin extends JavaPlugin implements Listener {
     private SelectionManager selectionManager;
     private TaxManager taxManager;
     private RentalManager rentalManager;
-    private ViewManager viewManager;
     private TransactionQueue transactionQueue;
     private CoinCardAPI coinCardAPI;
     private Economy economy;
@@ -92,7 +91,6 @@ public class LandCoin extends JavaPlugin implements Listener {
         this.landManager = new LandManager(this);
         this.subAreaManager = new SubAreaManager(this);
         this.selectionManager = new SelectionManager(this);
-        this.viewManager = new ViewManager(this);
         this.transactionQueue = new TransactionQueue(this, 1100);
         this.taxManager = new TaxManager(this);
         this.rentalManager = new RentalManager(this);
@@ -137,7 +135,6 @@ public class LandCoin extends JavaPlugin implements Listener {
         if (rentalManager != null) rentalManager.stopTimer();
         if (transactionQueue != null) transactionQueue.shutdown();
         if (dataManager != null) dataManager.saveAll();
-        if (viewManager != null) viewManager.clearAll();
         getLogger().info("LandCoin disabled.");
     }
 
@@ -180,7 +177,6 @@ public class LandCoin extends JavaPlugin implements Listener {
     public TransactionQueue getTransactionQueue() { return transactionQueue; }
     public TaxManager getTaxManager() { return taxManager; }
     public RentalManager getRentalManager() { return rentalManager; }
-    public ViewManager getViewManager() { return viewManager; }
 
     public static String formatCoin(double amount) {
         return formatCoin(BigDecimal.valueOf(amount));
@@ -1791,7 +1787,7 @@ public class LandCoin extends JavaPlugin implements Listener {
             player.sendMessage(ChatColor.GREEN + "You are no longer renting this land");
         }
 
-        public void trustLand(Player player, Land land, Player target, Role role) {
+        public void trustLand(Player player, Land land, UUID targetUUID, Role role) {
             if (!land.getOwner().equals(player.getUniqueId()) && !player.hasPermission("landcoin.admin")) {
                 player.sendMessage(ChatColor.RED + "You don't own this land!");
                 return;
@@ -1802,28 +1798,232 @@ public class LandCoin extends JavaPlugin implements Listener {
                 return;
             }
 
-            land.setRole(target.getUniqueId(), role);
+            land.setRole(targetUUID, role);
             plugin.getDataManager().saveAll();
-            player.sendMessage(ChatColor.GREEN + target.getName() + " now has role " + role + " in this land");
             
-            if (target.isOnline()) {
+            String targetName = Bukkit.getOfflinePlayer(targetUUID).getName();
+            player.sendMessage(ChatColor.GREEN + targetName + " now has role " + role + " in this land");
+            
+            Player target = Bukkit.getPlayer(targetUUID);
+            if (target != null && target.isOnline()) {
                 target.sendMessage(ChatColor.GREEN + "You now have role " + role + " in " + player.getName() + "'s land");
             }
         }
 
-        public void untrustLand(Player player, Land land, Player target) {
+        public void untrustLand(Player player, Land land, UUID targetUUID) {
             if (!land.getOwner().equals(player.getUniqueId()) && !player.hasPermission("landcoin.admin")) {
                 player.sendMessage(ChatColor.RED + "You don't own this land!");
                 return;
             }
 
-            land.removeMember(target.getUniqueId());
+            land.removeMember(targetUUID);
             plugin.getDataManager().saveAll();
-            player.sendMessage(ChatColor.GREEN + target.getName() + " no longer has trust in this land");
             
-            if (target.isOnline()) {
+            String targetName = Bukkit.getOfflinePlayer(targetUUID).getName();
+            player.sendMessage(ChatColor.GREEN + targetName + " no longer has trust in this land");
+            
+            Player target = Bukkit.getPlayer(targetUUID);
+            if (target != null && target.isOnline()) {
                 target.sendMessage(ChatColor.RED + "You lost trust in " + player.getName() + "'s land");
             }
+        }
+
+        public void trustLandsInSelection(Player player, SelectionManager.Selection sel, UUID targetUUID, Role role) {
+            if (!sel.isValid()) {
+                player.sendMessage(ChatColor.RED + "Make a selection first with /selection!");
+                return;
+            }
+
+            int count = 0;
+            for (String chunkKey : sel.getChunks()) {
+                Land land = plugin.getDataManager().getLand(chunkKey);
+                if (land != null && (land.getOwner().equals(player.getUniqueId()) || player.hasPermission("landcoin.admin"))) {
+                    land.setRole(targetUUID, role);
+                    count++;
+                }
+            }
+
+            if (count > 0) {
+                plugin.getDataManager().saveAll();
+                String targetName = Bukkit.getOfflinePlayer(targetUUID).getName();
+                player.sendMessage(ChatColor.GREEN + "Gave role " + role + " to " + targetName + " in " + count + " lands");
+                
+                Player target = Bukkit.getPlayer(targetUUID);
+                if (target != null && target.isOnline()) {
+                    target.sendMessage(ChatColor.GREEN + "You now have role " + role + " in " + count + " lands owned by " + player.getName());
+                }
+            } else {
+                player.sendMessage(ChatColor.YELLOW + "No eligible lands found in selection");
+            }
+        }
+
+        public void untrustLandsInSelection(Player player, SelectionManager.Selection sel, UUID targetUUID) {
+            if (!sel.isValid()) {
+                player.sendMessage(ChatColor.RED + "Make a selection first with /selection!");
+                return;
+            }
+
+            int count = 0;
+            for (String chunkKey : sel.getChunks()) {
+                Land land = plugin.getDataManager().getLand(chunkKey);
+                if (land != null && (land.getOwner().equals(player.getUniqueId()) || player.hasPermission("landcoin.admin"))) {
+                    land.removeMember(targetUUID);
+                    count++;
+                }
+            }
+
+            if (count > 0) {
+                plugin.getDataManager().saveAll();
+                String targetName = Bukkit.getOfflinePlayer(targetUUID).getName();
+                player.sendMessage(ChatColor.GREEN + "Removed trust from " + targetName + " in " + count + " lands");
+                
+                Player target = Bukkit.getPlayer(targetUUID);
+                if (target != null && target.isOnline()) {
+                    target.sendMessage(ChatColor.RED + "You lost trust in " + count + " lands owned by " + player.getName());
+                }
+            } else {
+                player.sendMessage(ChatColor.YELLOW + "No eligible lands found in selection");
+            }
+        }
+
+        public void setPermissionsInSelection(Player player, SelectionManager.Selection sel, Role role, PermissionType perm, boolean value) {
+            if (!sel.isValid()) {
+                player.sendMessage(ChatColor.RED + "Make a selection first with /selection!");
+                return;
+            }
+
+            int count = 0;
+            for (String chunkKey : sel.getChunks()) {
+                Land land = plugin.getDataManager().getLand(chunkKey);
+                if (land != null && (land.getOwner().equals(player.getUniqueId()) || player.hasPermission("landcoin.admin"))) {
+                    land.getPermissions().setPermission(role, perm, value);
+                    count++;
+                }
+            }
+
+            if (count > 0) {
+                plugin.getDataManager().saveAll();
+                player.sendMessage(ChatColor.GREEN + "Set permission " + perm + " to " + value + " for role " + role + " in " + count + " lands");
+            } else {
+                player.sendMessage(ChatColor.YELLOW + "No eligible lands found in selection");
+            }
+        }
+
+        public void setLandForRentInSelection(Player player, SelectionManager.Selection sel, double price) {
+            if (!sel.isValid()) {
+                player.sendMessage(ChatColor.RED + "Make a selection first with /selection!");
+                return;
+            }
+
+            if (price <= 0) {
+                player.sendMessage(ChatColor.RED + "Price must be positive!");
+                return;
+            }
+
+            int count = 0;
+            for (String chunkKey : sel.getChunks()) {
+                Land land = plugin.getDataManager().getLand(chunkKey);
+                if (land != null && (land.getOwner().equals(player.getUniqueId()) || player.hasPermission("landcoin.admin"))) {
+                    land.setForRent(price);
+                    count++;
+                }
+            }
+
+            if (count > 0) {
+                plugin.getDataManager().saveAll();
+                player.sendMessage(ChatColor.GREEN + "Set " + count + " lands for rent at " + formatCoin(price) + " coins/day");
+            } else {
+                player.sendMessage(ChatColor.YELLOW + "No lands you own found in selection");
+            }
+        }
+
+        public void setLandForSaleInSelection(Player player, SelectionManager.Selection sel, double price) {
+            if (!sel.isValid()) {
+                player.sendMessage(ChatColor.RED + "Make a selection first with /selection!");
+                return;
+            }
+
+            if (price <= 0) {
+                player.sendMessage(ChatColor.RED + "Price must be positive!");
+                return;
+            }
+
+            int count = 0;
+            for (String chunkKey : sel.getChunks()) {
+                Land land = plugin.getDataManager().getLand(chunkKey);
+                if (land != null && (land.getOwner().equals(player.getUniqueId()) || player.hasPermission("landcoin.admin"))) {
+                    land.setForSale(price);
+                    count++;
+                }
+            }
+
+            if (count > 0) {
+                plugin.getDataManager().saveAll();
+                player.sendMessage(ChatColor.GREEN + "Set " + count + " lands for sale at " + formatCoin(price) + " coins");
+            } else {
+                player.sendMessage(ChatColor.YELLOW + "No lands you own found in selection");
+            }
+        }
+
+        public void clearLandForRentInSelection(Player player, SelectionManager.Selection sel) {
+            if (!sel.isValid()) {
+                player.sendMessage(ChatColor.RED + "Make a selection first with /selection!");
+                return;
+            }
+
+            int count = 0;
+            for (String chunkKey : sel.getChunks()) {
+                Land land = plugin.getDataManager().getLand(chunkKey);
+                if (land != null && (land.getOwner().equals(player.getUniqueId()) || player.hasPermission("landcoin.admin"))) {
+                    land.clearForRent();
+                    count++;
+                }
+            }
+
+            if (count > 0) {
+                plugin.getDataManager().saveAll();
+                player.sendMessage(ChatColor.GREEN + "Removed rent from " + count + " lands");
+            } else {
+                player.sendMessage(ChatColor.YELLOW + "No lands you own found in selection");
+            }
+        }
+
+        public void clearLandForSaleInSelection(Player player, SelectionManager.Selection sel) {
+            if (!sel.isValid()) {
+                player.sendMessage(ChatColor.RED + "Make a selection first with /selection!");
+                return;
+            }
+
+            int count = 0;
+            for (String chunkKey : sel.getChunks()) {
+                Land land = plugin.getDataManager().getLand(chunkKey);
+                if (land != null && (land.getOwner().equals(player.getUniqueId()) || player.hasPermission("landcoin.admin"))) {
+                    land.clearForSale();
+                    count++;
+                }
+            }
+
+            if (count > 0) {
+                plugin.getDataManager().saveAll();
+                player.sendMessage(ChatColor.GREEN + "Removed sale from " + count + " lands");
+            } else {
+                player.sendMessage(ChatColor.YELLOW + "No lands you own found in selection");
+            }
+        }
+        
+        public Map<String, Integer> getLandOwnershipStats(SelectionManager.Selection sel) {
+            Map<String, Integer> stats = new HashMap<>();
+            if (!sel.isValid()) return stats;
+            
+            for (String chunkKey : sel.getChunks()) {
+                Land land = plugin.getDataManager().getLand(chunkKey);
+                if (land != null && land.getOwner() != null) {
+                    String ownerName = Bukkit.getOfflinePlayer(land.getOwner()).getName();
+                    if (ownerName == null) ownerName = "Unknown";
+                    stats.put(ownerName, stats.getOrDefault(ownerName, 0) + 1);
+                }
+            }
+            return stats;
         }
     }
 
@@ -2031,7 +2231,7 @@ public class LandCoin extends JavaPlugin implements Listener {
             player.sendMessage(ChatColor.GREEN + "You are no longer renting this sub-area");
         }
 
-        public void trustSubArea(Player player, SubArea area, Player target, Role role) {
+        public void trustSubArea(Player player, SubArea area, UUID targetUUID, Role role) {
             for (String chunkKey : area.getChunkKeys()) {
                 Land land = plugin.getDataManager().getLand(chunkKey);
                 if (land == null || (!land.getOwner().equals(player.getUniqueId()) && !player.hasPermission("landcoin.admin"))) {
@@ -2045,16 +2245,19 @@ public class LandCoin extends JavaPlugin implements Listener {
                 return;
             }
 
-            area.setRole(target.getUniqueId(), role);
+            area.setRole(targetUUID, role);
             plugin.getDataManager().saveAll();
-            player.sendMessage(ChatColor.GREEN + target.getName() + " now has role " + role + " in this sub-area");
             
-            if (target.isOnline()) {
+            String targetName = Bukkit.getOfflinePlayer(targetUUID).getName();
+            player.sendMessage(ChatColor.GREEN + targetName + " now has role " + role + " in this sub-area");
+            
+            Player target = Bukkit.getPlayer(targetUUID);
+            if (target != null && target.isOnline()) {
                 target.sendMessage(ChatColor.GREEN + "You now have role " + role + " in a sub-area owned by " + player.getName());
             }
         }
 
-        public void untrustSubArea(Player player, SubArea area, Player target) {
+        public void untrustSubArea(Player player, SubArea area, UUID targetUUID) {
             for (String chunkKey : area.getChunkKeys()) {
                 Land land = plugin.getDataManager().getLand(chunkKey);
                 if (land == null || (!land.getOwner().equals(player.getUniqueId()) && !player.hasPermission("landcoin.admin"))) {
@@ -2063,11 +2266,14 @@ public class LandCoin extends JavaPlugin implements Listener {
                 }
             }
 
-            area.removeMember(target.getUniqueId());
+            area.removeMember(targetUUID);
             plugin.getDataManager().saveAll();
-            player.sendMessage(ChatColor.GREEN + target.getName() + " no longer has trust in this sub-area");
             
-            if (target.isOnline()) {
+            String targetName = Bukkit.getOfflinePlayer(targetUUID).getName();
+            player.sendMessage(ChatColor.GREEN + targetName + " no longer has trust in this sub-area");
+            
+            Player target = Bukkit.getPlayer(targetUUID);
+            if (target != null && target.isOnline()) {
                 target.sendMessage(ChatColor.RED + "You lost trust in a sub-area owned by " + player.getName());
             }
         }
@@ -2076,7 +2282,6 @@ public class LandCoin extends JavaPlugin implements Listener {
     public static class SelectionManager {
         private final LandCoin plugin;
         private final Map<UUID, Selection> selections = new ConcurrentHashMap<>();
-        private final Map<UUID, Integer> viewTasks = new ConcurrentHashMap<>();
         private ItemStack wandItem;
 
         public SelectionManager(LandCoin plugin) {
@@ -2104,70 +2309,14 @@ public class LandCoin extends JavaPlugin implements Listener {
 
         public void setPos1(UUID playerId, Location loc) {
             getSelection(playerId).setPos1(loc);
-            showSelectionPreview(playerId);
         }
 
         public void setPos2(UUID playerId, Location loc) {
             getSelection(playerId).setPos2(loc);
-            showSelectionPreview(playerId);
         }
 
         public void clearSelection(UUID playerId) {
             selections.remove(playerId);
-            cancelViewTask(playerId);
-        }
-
-        private void showSelectionPreview(UUID playerId) {
-            cancelViewTask(playerId);
-            Player player = Bukkit.getPlayer(playerId);
-            if (player == null) return;
-
-            Selection sel = getSelection(playerId);
-            if (!sel.isValid()) return;
-
-            BukkitTask task = new BukkitRunnable() {
-                int ticks = 0;
-                @Override
-                public void run() {
-                    if (ticks++ >= 1200) {
-                        cancel();
-                        viewTasks.remove(playerId);
-                        return;
-                    }
-
-                    for (String chunkKey : sel.getChunks()) {
-                        String[] parts = chunkKey.split(",");
-                        World w = Bukkit.getWorld(parts[0]);
-                        if (w == null) continue;
-                        
-                        int x = Integer.parseInt(parts[1]);
-                        int z = Integer.parseInt(parts[2]);
-
-                        for (int dx = 0; dx < 16; dx++) {
-                            spawnBorderParticle(player, w, x, z, dx, 0);
-                            spawnBorderParticle(player, w, x, z, dx, 15);
-                        }
-                        for (int dz = 0; dz < 16; dz++) {
-                            spawnBorderParticle(player, w, x, z, 0, dz);
-                            spawnBorderParticle(player, w, x, z, 15, dz);
-                        }
-                    }
-                }
-                
-                private void spawnBorderParticle(Player player, World w, int chunkX, int chunkZ, int dx, int dz) {
-                    Location loc = new Location(w, (chunkX << 4) + dx, 64, (chunkZ << 4) + dz);
-                    player.spawnParticle(Particle.VILLAGER_HAPPY, loc, 1, 0.5, 5, 0.5, 0);
-                }
-            }.runTaskTimer(plugin, 0L, 10L);
-
-            viewTasks.put(playerId, task.getTaskId());
-        }
-
-        private void cancelViewTask(UUID playerId) {
-            Integer taskId = viewTasks.remove(playerId);
-            if (taskId != null) {
-                Bukkit.getScheduler().cancelTask(taskId);
-            }
         }
 
         public static class Selection {
@@ -2214,115 +2363,6 @@ public class LandCoin extends JavaPlugin implements Listener {
                         maxY1 < area.minY || minY1 > area.maxY ||
                         maxZ1 < area.minZ || minZ1 > area.maxZ);
             }
-        }
-    }
-
-    public static class ViewManager {
-        private final LandCoin plugin;
-        private final Map<UUID, Integer> viewTasks = new HashMap<>();
-
-        public ViewManager(LandCoin plugin) { this.plugin = plugin; }
-
-        public void showLandView(Player player, Land land) {
-            cancelView(player);
-
-            BukkitTask task = new BukkitRunnable() {
-                int ticks = 0;
-                @Override
-                public void run() {
-                    if (ticks++ >= 1200) {
-                        cancel();
-                        viewTasks.remove(player.getUniqueId());
-                        return;
-                    }
-
-                    Particle particle = getParticleForLand(land, player);
-                    if (particle == null) return;
-
-                    World world = Bukkit.getWorld(land.getWorld());
-                    if (world == null) return;
-
-                    for (int dx = 0; dx < 16; dx++) {
-                        spawnBorderParticle(player, world, land.getX(), land.getZ(), dx, 0, particle);
-                        spawnBorderParticle(player, world, land.getX(), land.getZ(), dx, 15, particle);
-                    }
-                    for (int dz = 0; dz < 16; dz++) {
-                        spawnBorderParticle(player, world, land.getX(), land.getZ(), 0, dz, particle);
-                        spawnBorderParticle(player, world, land.getX(), land.getZ(), 15, dz, particle);
-                    }
-                }
-                
-                private void spawnBorderParticle(Player player, World world, int chunkX, int chunkZ, int dx, int dz, Particle particle) {
-                    Location loc = new Location(world, (chunkX << 4) + dx, 64, (chunkZ << 4) + dz);
-                    player.spawnParticle(particle, loc, 1, 0.5, 5, 0.5, 0);
-                }
-            }.runTaskTimer(plugin, 0L, 10L);
-
-            viewTasks.put(player.getUniqueId(), task.getTaskId());
-        }
-
-        public void showAllLandsView(Player player) {
-            cancelView(player);
-
-            BukkitTask task = new BukkitRunnable() {
-                int ticks = 0;
-                @Override
-                public void run() {
-                    if (ticks++ >= 1200) {
-                        cancel();
-                        viewTasks.remove(player.getUniqueId());
-                        return;
-                    }
-
-                    for (Land land : plugin.getDataManager().getLands()) {
-                        Particle particle = getParticleForLand(land, player);
-                        if (particle == null) continue;
-
-                        World world = Bukkit.getWorld(land.getWorld());
-                        if (world == null) continue;
-
-                        for (int dx = 0; dx < 16; dx++) {
-                            spawnBorderParticle(player, world, land.getX(), land.getZ(), dx, 0, particle);
-                            spawnBorderParticle(player, world, land.getX(), land.getZ(), dx, 15, particle);
-                        }
-                        for (int dz = 0; dz < 16; dz++) {
-                            spawnBorderParticle(player, world, land.getX(), land.getZ(), 0, dz, particle);
-                            spawnBorderParticle(player, world, land.getX(), land.getZ(), 15, dz, particle);
-                        }
-                    }
-                }
-                
-                private void spawnBorderParticle(Player player, World world, int chunkX, int chunkZ, int dx, int dz, Particle particle) {
-                    Location loc = new Location(world, (chunkX << 4) + dx, 64, (chunkZ << 4) + dz);
-                    player.spawnParticle(particle, loc, 1, 0.5, 5, 0.5, 0);
-                }
-            }.runTaskTimer(plugin, 0L, 10L);
-
-            viewTasks.put(player.getUniqueId(), task.getTaskId());
-        }
-
-        private Particle getParticleForLand(Land land, Player player) {
-            if (land.getOwner() == null) {
-                return Particle.GLOW;
-            } else if (land.getOwner().equals(player.getUniqueId())) {
-                return Particle.VILLAGER_HAPPY;
-            } else {
-                return Particle.FLAME;
-            }
-        }
-
-        public void cancelView(Player player) {
-            Integer taskId = viewTasks.remove(player.getUniqueId());
-            if (taskId != null) {
-                Bukkit.getScheduler().cancelTask(taskId);
-            }
-        }
-
-        public void clearAll() {
-            for (int taskId : viewTasks.values()) {
-                Bukkit.getScheduler().cancelTask(taskId);
-            }
-            viewTasks.clear();
         }
     }
 
@@ -2664,19 +2704,21 @@ public class LandCoin extends JavaPlugin implements Listener {
             player.sendMessage(ChatColor.YELLOW + "/land unclaim " + ChatColor.GRAY + "- Unclaim selected chunks");
             player.sendMessage(ChatColor.YELLOW + "/land area claim <name> " + ChatColor.GRAY + "- Create sub-area");
             player.sendMessage(ChatColor.YELLOW + "/land area unclaim " + ChatColor.GRAY + "- Delete sub-area");
-            player.sendMessage(ChatColor.YELLOW + "/land set <role> <break/place/access/use> <true/false> " + ChatColor.GRAY + "- Set permissions");
+            player.sendMessage(ChatColor.YELLOW + "/land set <role> <break/place/access/use> <true/false> " + ChatColor.GRAY + "- Set permissions in selection");
             player.sendMessage(ChatColor.YELLOW + "/land rent " + ChatColor.GRAY + "- Rent current land");
             player.sendMessage(ChatColor.YELLOW + "/land area rent " + ChatColor.GRAY + "- Rent current sub-area");
             player.sendMessage(ChatColor.YELLOW + "/land unrent [all/area] " + ChatColor.GRAY + "- Stop renting");
-            player.sendMessage(ChatColor.YELLOW + "/land rental <price> " + ChatColor.GRAY + "- Set land for rent");
+            player.sendMessage(ChatColor.YELLOW + "/land rental <price> " + ChatColor.GRAY + "- Set lands in selection for rent");
+            player.sendMessage(ChatColor.YELLOW + "/land rental remove " + ChatColor.GRAY + "- Remove rent from lands in selection");
             player.sendMessage(ChatColor.YELLOW + "/land area rental <price> " + ChatColor.GRAY + "- Set sub-area for rent");
-            player.sendMessage(ChatColor.YELLOW + "/land sell <price> " + ChatColor.GRAY + "- Put land for sale");
+            player.sendMessage(ChatColor.YELLOW + "/land sell <price> " + ChatColor.GRAY + "- Set lands in selection for sale");
+            player.sendMessage(ChatColor.YELLOW + "/land sell remove " + ChatColor.GRAY + "- Remove sale from lands in selection");
             player.sendMessage(ChatColor.YELLOW + "/land buy " + ChatColor.GRAY + "- Buy selected lands");
             player.sendMessage(ChatColor.YELLOW + "/land info " + ChatColor.GRAY + "- Show land info");
-            player.sendMessage(ChatColor.YELLOW + "/land view " + ChatColor.GRAY + "- Show all lands");
-            player.sendMessage(ChatColor.YELLOW + "/land trust <player> [role] " + ChatColor.GRAY + "- Trust player with role");
+            player.sendMessage(ChatColor.YELLOW + "/land view " + ChatColor.GRAY + "- Show stats of selected lands");
+            player.sendMessage(ChatColor.YELLOW + "/land trust <player> [role] " + ChatColor.GRAY + "- Trust player with role in selection");
             player.sendMessage(ChatColor.YELLOW + "/land area trust <player> [role] " + ChatColor.GRAY + "- Trust player with role in sub-area");
-            player.sendMessage(ChatColor.YELLOW + "/land untrust <player> " + ChatColor.GRAY + "- Remove trust from land");
+            player.sendMessage(ChatColor.YELLOW + "/land untrust <player> " + ChatColor.GRAY + "- Remove trust from selection");
             player.sendMessage(ChatColor.YELLOW + "/land area untrust <player> " + ChatColor.GRAY + "- Remove trust from sub-area");
             player.sendMessage(ChatColor.YELLOW + "/land admin setowner <player> " + ChatColor.GRAY + "- Set owner of selected lands");
             player.sendMessage(ChatColor.YELLOW + "/land admin unclaim " + ChatColor.GRAY + "- Admin unclaim selected lands");
@@ -2777,15 +2819,11 @@ public class LandCoin extends JavaPlugin implements Listener {
                         player.sendMessage(ChatColor.RED + "You are not in a sub-area!");
                         return true;
                     }
-                    Player target = Bukkit.getPlayer(args[2]);
-                    if (target == null) {
-                        OfflinePlayer offline = Bukkit.getOfflinePlayer(args[2]);
-                        if (offline.hasPlayedBefore()) {
-                            target = offline.getPlayer();
-                        } else {
-                            player.sendMessage(ChatColor.RED + "Player not found!");
-                            return true;
-                        }
+                    
+                    UUID targetUUID = getPlayerUUID(args[2]);
+                    if (targetUUID == null) {
+                        player.sendMessage(ChatColor.RED + "Player not found!");
+                        return true;
                     }
                     
                     Role role = Role.TRUST;
@@ -2798,7 +2836,7 @@ public class LandCoin extends JavaPlugin implements Listener {
                         }
                     }
                     
-                    subAreaManager.trustSubArea(player, areaToTrust, target, role);
+                    subAreaManager.trustSubArea(player, areaToTrust, targetUUID, role);
                     return true;
 
                 case "untrust":
@@ -2811,17 +2849,12 @@ public class LandCoin extends JavaPlugin implements Listener {
                         player.sendMessage(ChatColor.RED + "You are not in a sub-area!");
                         return true;
                     }
-                    target = Bukkit.getPlayer(args[2]);
-                    if (target == null) {
-                        OfflinePlayer offline = Bukkit.getOfflinePlayer(args[2]);
-                        if (offline.hasPlayedBefore()) {
-                            target = offline.getPlayer();
-                        } else {
-                            player.sendMessage(ChatColor.RED + "Player not found!");
-                            return true;
-                        }
+                    targetUUID = getPlayerUUID(args[2]);
+                    if (targetUUID == null) {
+                        player.sendMessage(ChatColor.RED + "Player not found!");
+                        return true;
                     }
-                    subAreaManager.untrustSubArea(player, areaToUntrust, target);
+                    subAreaManager.untrustSubArea(player, areaToUntrust, targetUUID);
                     return true;
 
                 default:
@@ -2841,20 +2874,9 @@ public class LandCoin extends JavaPlugin implements Listener {
                 PermissionType perm = PermissionType.valueOf(args[2].toUpperCase());
                 boolean value = Boolean.parseBoolean(args[3]);
 
-                Land land = landManager.getLandAt(player.getLocation());
-                if (land == null) {
-                    player.sendMessage(ChatColor.RED + "You are not in a claimed land!");
-                    return true;
-                }
-
-                if (!land.getOwner().equals(player.getUniqueId()) && !player.hasPermission("landcoin.admin")) {
-                    player.sendMessage(ChatColor.RED + "You don't own this land!");
-                    return true;
-                }
-
-                land.getPermissions().setPermission(role, perm, value);
-                dataManager.saveAll();
-                player.sendMessage(ChatColor.GREEN + "Permission set for role " + role + "!");
+                SelectionManager.Selection sel = selectionManager.getSelection(player.getUniqueId());
+                landManager.setPermissionsInSelection(player, sel, role, perm, value);
+                
             } catch (IllegalArgumentException e) {
                 player.sendMessage(ChatColor.RED + "Invalid role or permission type!");
             }
@@ -2915,33 +2937,13 @@ public class LandCoin extends JavaPlugin implements Listener {
 
         private boolean handleRental(Player player, String[] args) {
             if (args.length < 2) {
-                player.sendMessage(ChatColor.RED + "Usage: /land rental <price>");
+                player.sendMessage(ChatColor.RED + "Usage: /land rental <price> or /land rental remove");
                 return true;
             }
 
-            Land land = landManager.getLandAt(player.getLocation());
-            if (land == null) {
-                player.sendMessage(ChatColor.RED + "You are not in a claimed land!");
-                return true;
-            }
-
-            if (!land.getOwner().equals(player.getUniqueId()) && !player.hasPermission("landcoin.admin")) {
-                player.sendMessage(ChatColor.RED + "You don't own this land!");
-                return true;
-            }
-
-            try {
-                double price = Double.parseDouble(args[1]);
-                landManager.setLandForRent(player, land, price);
-            } catch (NumberFormatException e) {
-                player.sendMessage(ChatColor.RED + "Invalid price!");
-            }
-            return true;
-        }
-
-        private boolean handleSell(Player player, String[] args) {
-            if (args.length < 2) {
-                player.sendMessage(ChatColor.RED + "Usage: /land sell <price>");
+            if (args[1].equalsIgnoreCase("remove")) {
+                SelectionManager.Selection sel = selectionManager.getSelection(player.getUniqueId());
+                landManager.clearLandForRentInSelection(player, sel);
                 return true;
             }
 
@@ -2953,16 +2955,33 @@ public class LandCoin extends JavaPlugin implements Listener {
 
             try {
                 double price = Double.parseDouble(args[1]);
-                if (price <= 0) {
-                    player.sendMessage(ChatColor.RED + "Price must be positive!");
-                    return true;
-                }
-                for (String chunkKey : sel.getChunks()) {
-                    Land land = dataManager.getLand(chunkKey);
-                    if (land != null && land.getOwner().equals(player.getUniqueId())) {
-                        landManager.setLandForSale(player, land, price);
-                    }
-                }
+                landManager.setLandForRentInSelection(player, sel, price);
+            } catch (NumberFormatException e) {
+                player.sendMessage(ChatColor.RED + "Invalid price!");
+            }
+            return true;
+        }
+
+        private boolean handleSell(Player player, String[] args) {
+            if (args.length < 2) {
+                player.sendMessage(ChatColor.RED + "Usage: /land sell <price> or /land sell remove");
+                return true;
+            }
+
+            SelectionManager.Selection sel = selectionManager.getSelection(player.getUniqueId());
+            if (!sel.isValid()) {
+                player.sendMessage(ChatColor.RED + "Make a selection first with /selection!");
+                return true;
+            }
+
+            if (args[1].equalsIgnoreCase("remove")) {
+                landManager.clearLandForSaleInSelection(player, sel);
+                return true;
+            }
+
+            try {
+                double price = Double.parseDouble(args[1]);
+                landManager.setLandForSaleInSelection(player, sel, price);
             } catch (NumberFormatException e) {
                 player.sendMessage(ChatColor.RED + "Invalid price!");
             }
@@ -3014,108 +3033,87 @@ public class LandCoin extends JavaPlugin implements Listener {
         }
 
         private boolean handleView(Player player, String[] args) {
-            viewManager.showAllLandsView(player);
-            player.sendMessage(ChatColor.GREEN + "Showing all lands for 1 minute");
+            SelectionManager.Selection sel = selectionManager.getSelection(player.getUniqueId());
+            if (!sel.isValid()) {
+                player.sendMessage(ChatColor.RED + "Make a selection first with /selection!");
+                return true;
+            }
+            
+            Map<String, Integer> stats = landManager.getLandOwnershipStats(sel);
+            int totalLands = sel.getChunkCount();
+            int claimedLands = stats.values().stream().mapToInt(Integer::intValue).sum();
+            
+            player.sendMessage(ChatColor.GOLD + "=== Land Information ===");
+            player.sendMessage(ChatColor.YELLOW + "Total lands selected: " + ChatColor.WHITE + totalLands);
+            player.sendMessage(ChatColor.YELLOW + "Claimed lands: " + ChatColor.WHITE + claimedLands);
+            
+            if (!stats.isEmpty()) {
+                player.sendMessage(ChatColor.YELLOW + "Owners:");
+                stats.entrySet().stream()
+                    .sorted((a, b) -> b.getValue().compareTo(a.getValue()))
+                    .forEach(entry -> player.sendMessage(ChatColor.GRAY + "  - " + entry.getKey() + ": " + 
+                            ChatColor.WHITE + entry.getValue() + " lands"));
+            } else {
+                player.sendMessage(ChatColor.GRAY + "No claimed lands in selection");
+            }
             return true;
         }
 
-private boolean handleTrust(Player player, String[] args) {
-    if (args.length < 2) {
-        player.sendMessage(ChatColor.RED + "Usage: /land trust <player> [role]");
-        return true;
-    }
+        private boolean handleTrust(Player player, String[] args) {
+            if (args.length < 2) {
+                player.sendMessage(ChatColor.RED + "Usage: /land trust <player> [role]");
+                return true;
+            }
 
-    // Verifica se é comando para sub-area
-    if (args.length >= 3 && args[1].equalsIgnoreCase("area")) {
-        SubArea area = subAreaManager.getSubAreaAt(player.getLocation());
-        if (area == null) {
-            player.sendMessage(ChatColor.RED + "You are not in a sub-area!");
-            return true;
-        }
-        
-        // Obter UUID do jogador alvo
-        String targetName = args[2];
-        UUID targetUUID = null;
-        
-        Player target = Bukkit.getPlayer(targetName);
-        if (target != null) {
-            targetUUID = target.getUniqueId();
-        } else {
-            OfflinePlayer offline = Bukkit.getOfflinePlayer(targetName);
-            if (offline.hasPlayedBefore()) {
-                targetUUID = offline.getUniqueId();
+            // Check if it's a sub-area command
+            if (args.length >= 3 && args[1].equalsIgnoreCase("area")) {
+                SubArea area = subAreaManager.getSubAreaAt(player.getLocation());
+                if (area == null) {
+                    player.sendMessage(ChatColor.RED + "You are not in a sub-area!");
+                    return true;
+                }
+                
+                UUID targetUUID = getPlayerUUID(args[2]);
+                if (targetUUID == null) {
+                    player.sendMessage(ChatColor.RED + "Player not found!");
+                    return true;
+                }
+                
+                Role role = Role.TRUST;
+                if (args.length >= 4) {
+                    try {
+                        role = Role.valueOf(args[3].toUpperCase());
+                    } catch (IllegalArgumentException e) {
+                        player.sendMessage(ChatColor.RED + "Invalid role! Use ASSIST, TRUST, or MEMBER.");
+                        return true;
+                    }
+                }
+                
+                subAreaManager.trustSubArea(player, area, targetUUID, role);
+                return true;
             } else {
-                player.sendMessage(ChatColor.RED + "Player not found: " + targetName);
+                // Land trust with selection
+                UUID targetUUID = getPlayerUUID(args[1]);
+                if (targetUUID == null) {
+                    player.sendMessage(ChatColor.RED + "Player not found!");
+                    return true;
+                }
+                
+                Role role = Role.TRUST;
+                if (args.length >= 3) {
+                    try {
+                        role = Role.valueOf(args[2].toUpperCase());
+                    } catch (IllegalArgumentException e) {
+                        player.sendMessage(ChatColor.RED + "Invalid role! Use ASSIST, TRUST, or MEMBER.");
+                        return true;
+                    }
+                }
+                
+                SelectionManager.Selection sel = selectionManager.getSelection(player.getUniqueId());
+                landManager.trustLandsInSelection(player, sel, targetUUID, role);
                 return true;
             }
         }
-        
-        Role role = Role.TRUST;
-        if (args.length >= 4) {
-            try {
-                role = Role.valueOf(args[3].toUpperCase());
-            } catch (IllegalArgumentException e) {
-                player.sendMessage(ChatColor.RED + "Invalid role! Use ASSIST, TRUST, or MEMBER.");
-                return true;
-            }
-        }
-        
-        // Criar um Player temporário para passar para o método (opcional - pode modificar o método para aceitar UUID)
-        // Como o método trustSubArea espera um Player, vamos criar um "fake" ou modificar o método
-        Player offlinePlayer = Bukkit.getPlayer(targetUUID);
-        if (offlinePlayer == null) {
-            // Se estiver offline, não podemos passar null - precisamos modificar o método
-            player.sendMessage(ChatColor.RED + "Player must be online to trust!");
-            return true;
-        }
-        
-        subAreaManager.trustSubArea(player, area, offlinePlayer, role);
-        return true;
-    } else {
-        Land land = landManager.getLandAt(player.getLocation());
-        if (land == null) {
-            player.sendMessage(ChatColor.RED + "You are not in a claimed land!");
-            return true;
-        }
-        
-        // Obter UUID do jogador alvo
-        String targetName = args[1];
-        UUID targetUUID = null;
-        
-        Player target = Bukkit.getPlayer(targetName);
-        if (target != null) {
-            targetUUID = target.getUniqueId();
-        } else {
-            OfflinePlayer offline = Bukkit.getOfflinePlayer(targetName);
-            if (offline.hasPlayedBefore()) {
-                targetUUID = offline.getUniqueId();
-            } else {
-                player.sendMessage(ChatColor.RED + "Player not found: " + targetName);
-                return true;
-            }
-        }
-        
-        Role role = Role.TRUST;
-        if (args.length >= 3) {
-            try {
-                role = Role.valueOf(args[2].toUpperCase());
-            } catch (IllegalArgumentException e) {
-                player.sendMessage(ChatColor.RED + "Invalid role! Use ASSIST, TRUST, or MEMBER.");
-                return true;
-            }
-        }
-        
-        // Verificar se o jogador está online
-        Player targetPlayer = Bukkit.getPlayer(targetUUID);
-        if (targetPlayer == null) {
-            player.sendMessage(ChatColor.RED + "Player must be online to trust!");
-            return true;
-        }
-        
-        landManager.trustLand(player, land, targetPlayer, role);
-        return true;
-    }
-}
 
         private boolean handleUntrust(Player player, String[] args) {
             if (args.length < 2) {
@@ -3123,154 +3121,141 @@ private boolean handleTrust(Player player, String[] args) {
                 return true;
             }
 
+            // Check if it's a sub-area command
             if (args.length >= 3 && args[1].equalsIgnoreCase("area")) {
                 SubArea area = subAreaManager.getSubAreaAt(player.getLocation());
                 if (area == null) {
                     player.sendMessage(ChatColor.RED + "You are not in a sub-area!");
                     return true;
                 }
-                Player target = Bukkit.getPlayer(args[2]);
-                if (target == null) {
-                    OfflinePlayer offline = Bukkit.getOfflinePlayer(args[2]);
-                    if (offline.hasPlayedBefore()) {
-                        target = offline.getPlayer();
-                    } else {
-                        player.sendMessage(ChatColor.RED + "Player not found!");
-                        return true;
-                    }
-                }
-                subAreaManager.untrustSubArea(player, area, target);
-                return true;
-            } else {
-                Land land = landManager.getLandAt(player.getLocation());
-                if (land == null) {
-                    player.sendMessage(ChatColor.RED + "You are not in a claimed land!");
+                UUID targetUUID = getPlayerUUID(args[2]);
+                if (targetUUID == null) {
+                    player.sendMessage(ChatColor.RED + "Player not found!");
                     return true;
                 }
-                Player target = Bukkit.getPlayer(args[1]);
-                if (target == null) {
-                    OfflinePlayer offline = Bukkit.getOfflinePlayer(args[1]);
-                    if (offline.hasPlayedBefore()) {
-                        target = offline.getPlayer();
-                    } else {
-                        player.sendMessage(ChatColor.RED + "Player not found!");
-                        return true;
-                    }
+                subAreaManager.untrustSubArea(player, area, targetUUID);
+                return true;
+            } else {
+                // Land untrust with selection
+                UUID targetUUID = getPlayerUUID(args[1]);
+                if (targetUUID == null) {
+                    player.sendMessage(ChatColor.RED + "Player not found!");
+                    return true;
                 }
-                landManager.untrustLand(player, land, target);
+                
+                SelectionManager.Selection sel = selectionManager.getSelection(player.getUniqueId());
+                landManager.untrustLandsInSelection(player, sel, targetUUID);
                 return true;
             }
         }
 
-private boolean handleAdmin(Player player, String[] args) {
-    if (!player.hasPermission("landcoin.admin")) {
-        player.sendMessage(ChatColor.RED + "No permission!");
-        return true;
-    }
-
-    if (args.length < 2) {
-        player.sendMessage(ChatColor.RED + "Usage: /land admin <setowner/unclaim/set/selection/nextday>");
-        return true;
-    }
-
-    String sub = args[1].toLowerCase();
-
-    switch (sub) {
-        case "setowner":
-            if (args.length < 3) {
-                player.sendMessage(ChatColor.RED + "Usage: /land admin setowner <player>");
+        private boolean handleAdmin(Player player, String[] args) {
+            if (!player.hasPermission("landcoin.admin")) {
+                player.sendMessage(ChatColor.RED + "No permission!");
                 return true;
             }
-            
-            SelectionManager.Selection sel = selectionManager.getSelection(player.getUniqueId());
-            if (!sel.isValid()) {
-                player.sendMessage(ChatColor.RED + "Make a selection first with /selection!");
+
+            if (args.length < 2) {
+                player.sendMessage(ChatColor.RED + "Usage: /land admin <setowner/unclaim/set/selection/nextday>");
                 return true;
             }
-            
-            // Obter UUID do jogador (online ou offline)
-            UUID targetUUID = null;
-            String targetName = args[2];
-            
-            // Tenta encontrar jogador online
-            Player target = Bukkit.getPlayer(targetName);
-            if (target != null) {
-                targetUUID = target.getUniqueId();
-            } else {
-                // Tenta offline player
-                OfflinePlayer offline = Bukkit.getOfflinePlayer(targetName);
-                if (offline.hasPlayedBefore()) {
-                    targetUUID = offline.getUniqueId();
-                } else {
-                    player.sendMessage(ChatColor.RED + "Player not found: " + targetName);
+
+            String sub = args[1].toLowerCase();
+
+            switch (sub) {
+                case "setowner":
+                    if (args.length < 3) {
+                        player.sendMessage(ChatColor.RED + "Usage: /land admin setowner <player>");
+                        return true;
+                    }
+                    
+                    SelectionManager.Selection sel = selectionManager.getSelection(player.getUniqueId());
+                    if (!sel.isValid()) {
+                        player.sendMessage(ChatColor.RED + "Make a selection first with /selection!");
+                        return true;
+                    }
+                    
+                    UUID targetUUID = getPlayerUUID(args[2]);
+                    if (targetUUID == null) {
+                        player.sendMessage(ChatColor.RED + "Player not found!");
+                        return true;
+                    }
+                    
+                    int transferred = 0;
+                    for (String chunkKey : sel.getChunks()) {
+                        Land land = dataManager.getLand(chunkKey);
+                        if (land != null) {
+                            land.setOwner(targetUUID);
+                            transferred++;
+                        }
+                    }
+                    
+                    if (transferred > 0) {
+                        dataManager.saveAll();
+                        player.sendMessage(ChatColor.GREEN + "Transferred " + transferred + 
+                                " lands to " + args[2]);
+                    } else {
+                        player.sendMessage(ChatColor.YELLOW + "No lands found in selection to transfer");
+                    }
                     return true;
-                }
-            }
-            
-            int transferred = 0;
-            for (String chunkKey : sel.getChunks()) {
-                Land land = dataManager.getLand(chunkKey);
-                if (land != null) {
-                    land.setOwner(targetUUID);
-                    transferred++;
-                }
-            }
-            
-            if (transferred > 0) {
-                dataManager.saveAll();
-                player.sendMessage(ChatColor.GREEN + "Transferred " + transferred + 
-                        " lands to " + targetName);
-            } else {
-                player.sendMessage(ChatColor.YELLOW + "No lands found in selection to transfer");
-            }
-            return true;
 
-        case "unclaim":
-            sel = selectionManager.getSelection(player.getUniqueId());
-            if (!sel.isValid()) {
-                player.sendMessage(ChatColor.RED + "Make a selection first with /selection!");
-                return true;
-            }
-            
-            int unclaimed = 0;
-            for (String chunkKey : sel.getChunks()) {
-                Land land = dataManager.getLand(chunkKey);
-                if (land != null) {
-                    dataManager.removeLand(chunkKey);
-                    unclaimed++;
-                }
-            }
-            
-            if (unclaimed > 0) {
-                dataManager.saveAll();
-                player.sendMessage(ChatColor.GREEN + "Admin unclaimed " + unclaimed + " lands");
-            } else {
-                player.sendMessage(ChatColor.YELLOW + "No lands found in selection to unclaim");
-            }
-            return true;
+                case "unclaim":
+                    sel = selectionManager.getSelection(player.getUniqueId());
+                    if (!sel.isValid()) {
+                        player.sendMessage(ChatColor.RED + "Make a selection first with /selection!");
+                        return true;
+                    }
+                    
+                    int unclaimed = 0;
+                    for (String chunkKey : sel.getChunks()) {
+                        Land land = dataManager.getLand(chunkKey);
+                        if (land != null) {
+                            dataManager.removeLand(chunkKey);
+                            unclaimed++;
+                        }
+                    }
+                    
+                    if (unclaimed > 0) {
+                        dataManager.saveAll();
+                        player.sendMessage(ChatColor.GREEN + "Admin unclaimed " + unclaimed + " lands");
+                    } else {
+                        player.sendMessage(ChatColor.YELLOW + "No lands found in selection to unclaim");
+                    }
+                    return true;
 
-        case "set":
-            if (args.length < 5) {
-                player.sendMessage(ChatColor.RED + "Usage: /land admin set <role> <break/place/access/use> <true/false>");
-                return true;
+                case "set":
+                    if (args.length < 5) {
+                        player.sendMessage(ChatColor.RED + "Usage: /land admin set <role> <break/place/access/use> <true/false>");
+                        return true;
+                    }
+                    try {
+                        Role role = Role.valueOf(args[2].toUpperCase());
+                        PermissionType perm = PermissionType.valueOf(args[3].toUpperCase());
+                        boolean value = Boolean.parseBoolean(args[4]);
+
+                        sel = selectionManager.getSelection(player.getUniqueId());
+                        landManager.setPermissionsInSelection(player, sel, role, perm, value);
+                        
+                    } catch (IllegalArgumentException e) {
+                        player.sendMessage(ChatColor.RED + "Invalid role or permission type!");
+                    }
+                    return true;
+
+                case "selection":
+                    player.getInventory().addItem(selectionManager.getWandItem());
+                    player.sendMessage(ChatColor.GREEN + "You received the admin selection wand");
+                    return true;
+
+                case "nextday":
+                    taxManager.forceProcessNextDay();
+                    player.sendMessage(ChatColor.GREEN + "Forced next day tax and rental processing");
+                    return true;
+
+                default:
+                    player.sendMessage(ChatColor.RED + "Unknown admin command");
+                    return true;
             }
-            return handleSet(player, new String[]{"set", args[2], args[3], args[4]});
-
-        case "selection":
-            player.getInventory().addItem(selectionManager.getWandItem());
-            player.sendMessage(ChatColor.GREEN + "You received the admin selection wand");
-            return true;
-
-        case "nextday":
-            taxManager.forceProcessNextDay();
-            player.sendMessage(ChatColor.GREEN + "Forced next day tax and rental processing");
-            return true;
-
-        default:
-            player.sendMessage(ChatColor.RED + "Unknown admin command");
-            return true;
-    }
-}
+        }
 
         private boolean handleReload(Player player) {
             if (!player.hasPermission("landcoin.admin")) {
@@ -3282,6 +3267,16 @@ private boolean handleAdmin(Player player, String[] args) {
             dataManager.loadAll();
             player.sendMessage(ChatColor.GREEN + "LandCoin reloaded!");
             return true;
+        }
+
+        private UUID getPlayerUUID(String name) {
+            Player online = Bukkit.getPlayer(name);
+            if (online != null) return online.getUniqueId();
+            
+            OfflinePlayer offline = Bukkit.getOfflinePlayer(name);
+            if (offline.hasPlayedBefore()) return offline.getUniqueId();
+            
+            return null;
         }
 
         @Override
@@ -3311,6 +3306,9 @@ private boolean handleAdmin(Player player, String[] args) {
                 if (sub.equals("unrent")) {
                     completions.addAll(Arrays.asList("all", "area"));
                 }
+                if (sub.equals("rental") || sub.equals("sell")) {
+                    completions.addAll(Arrays.asList("<price>", "remove"));
+                }
                 if (sub.equals("trust") || sub.equals("untrust")) {
                     completions.addAll(getAllPlayerNames());
                 }
@@ -3333,6 +3331,13 @@ private boolean handleAdmin(Player player, String[] args) {
                     String adminSub = args[1].toLowerCase();
                     if (adminSub.equals("setowner")) {
                         completions.addAll(getAllPlayerNames());
+                        return filter(completions, args[2]);
+                    }
+                    if (adminSub.equals("set")) {
+                        completions.addAll(Arrays.stream(Role.values())
+                                .map(Enum::name)
+                                .filter(r -> !r.equals("NONE"))
+                                .collect(Collectors.toList()));
                         return filter(completions, args[2]);
                     }
                 }
@@ -3361,6 +3366,15 @@ private boolean handleAdmin(Player player, String[] args) {
                     completions.addAll(Arrays.asList("true", "false"));
                     return filter(completions, args[3]);
                 }
+                if (sub.equals("admin")) {
+                    if (args[1].equalsIgnoreCase("set")) {
+                        completions.addAll(Arrays.stream(PermissionType.values())
+                                .map(Enum::name)
+                                .map(String::toLowerCase)
+                                .collect(Collectors.toList()));
+                        return filter(completions, args[3]);
+                    }
+                }
                 if (sub.equals("trust") && !args[1].equalsIgnoreCase("area")) {
                     completions.addAll(Arrays.stream(Role.values())
                             .map(Enum::name)
@@ -3374,6 +3388,14 @@ private boolean handleAdmin(Player player, String[] args) {
                             .filter(r -> r.equals("ASSIST") || r.equals("TRUST") || r.equals("MEMBER"))
                             .collect(Collectors.toList()));
                     return filter(completions, args[3]);
+                }
+            }
+
+            if (args.length == 5) {
+                String sub = args[0].toLowerCase();
+                if (sub.equals("admin") && args[1].equalsIgnoreCase("set")) {
+                    completions.addAll(Arrays.asList("true", "false"));
+                    return filter(completions, args[4]);
                 }
             }
 
@@ -3438,18 +3460,8 @@ private boolean handleAdmin(Player player, String[] args) {
                     }
                     return true;
 
-                case "view":
-                    sel = selectionManager.getSelection(player.getUniqueId());
-                    if (!sel.isValid()) {
-                        player.sendMessage(ChatColor.RED + "No valid selection!");
-                    } else {
-                        viewManager.showAllLandsView(player);
-                        player.sendMessage(ChatColor.GREEN + "Showing selection lands for 1 minute");
-                    }
-                    return true;
-
                 default:
-                    player.sendMessage(ChatColor.RED + "Unknown command. Use /selection [clear/info/view]");
+                    player.sendMessage(ChatColor.RED + "Unknown command. Use /selection [clear/info]");
                     return true;
             }
         }
@@ -3457,7 +3469,7 @@ private boolean handleAdmin(Player player, String[] args) {
         @Override
         public List<String> onTabComplete(CommandSender sender, Command command, String alias, String[] args) {
             if (args.length == 1) {
-                return filter(Arrays.asList("clear", "info", "view"), args[0]);
+                return filter(Arrays.asList("clear", "info"), args[0]);
             }
             return Collections.emptyList();
         }
@@ -3516,9 +3528,16 @@ private boolean handleAdmin(Player player, String[] args) {
             Material type = clickedBlock.getType();
             String typeName = type.name();
 
+            // Check for containers and interactive blocks
             if (typeName.contains("CHEST") || typeName.contains("FURNACE") || 
                 typeName.contains("HOPPER") || typeName.contains("DISPENSER") || 
-                typeName.contains("DROPPER") || typeName.contains("SHULKER_BOX")) {
+                typeName.contains("DROPPER") || typeName.contains("SHULKER_BOX") ||
+                typeName.contains("BARREL") || typeName.contains("BLAST_FURNACE") ||
+                typeName.contains("SMOKER") || typeName.contains("BREWING_STAND") ||
+                typeName.contains("BEACON") || typeName.contains("ANVIL") ||
+                typeName.contains("GRINDSTONE") || typeName.contains("CARTOGRAPHY_TABLE") ||
+                typeName.contains("LOOM") || typeName.contains("STONECUTTER") ||
+                clickedBlock.getState() instanceof Container) {
 
                 if (!landManager.canAccess(player, loc)) {
                     event.setCancelled(true);
@@ -3527,7 +3546,11 @@ private boolean handleAdmin(Player player, String[] args) {
 
             } else if (typeName.contains("DOOR") || typeName.contains("GATE") || 
                        typeName.contains("TRAPDOOR") || typeName.contains("FENCE_GATE") ||
-                       typeName.contains("BUTTON") || typeName.contains("LEVER")) {
+                       typeName.contains("BUTTON") || typeName.contains("LEVER") ||
+                       typeName.contains("PRESSURE_PLATE") || typeName.contains("REPEATER") ||
+                       typeName.contains("COMPARATOR") || typeName.contains("DAYLIGHT_DETECTOR") ||
+                       typeName.contains("NOTE_BLOCK") || typeName.contains("JUKEBOX") ||
+                       typeName.contains("CAKE") || typeName.contains("BED")) {
 
                 if (!landManager.canUse(player, loc)) {
                     event.setCancelled(true);
@@ -3646,6 +3669,5 @@ private boolean handleAdmin(Player player, String[] args) {
     @EventHandler
     public void onPlayerQuit(PlayerQuitEvent event) {
         selectionManager.clearSelection(event.getPlayer().getUniqueId());
-        viewManager.cancelView(event.getPlayer());
     }
 }
