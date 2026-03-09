@@ -16,11 +16,15 @@ import org.bukkit.block.Container;
 import org.bukkit.command.*;
 import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.entity.Player;
+import org.bukkit.entity.Projectile;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
 import org.bukkit.event.block.BlockBreakEvent;
 import org.bukkit.event.block.BlockPlaceEvent;
+import org.bukkit.event.entity.ProjectileHitEvent;
+import org.bukkit.event.player.PlayerBucketEmptyEvent;
+import org.bukkit.event.player.PlayerBucketFillEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerMoveEvent;
@@ -69,6 +73,10 @@ public class LandCoin extends JavaPlugin implements Listener {
     private TransactionQueue transactionQueue;
     private CoinCardAPI coinCardAPI;
     private Economy economy;
+    
+    // Mapa para rastrear últimas notificações de sub-área por jogador
+    private final Map<UUID, String> lastSubAreaNotification = new ConcurrentHashMap<>();
+    private final Map<UUID, Long> lastSubAreaNotificationTime = new ConcurrentHashMap<>();
 
     @Override
     public void onEnable() {
@@ -104,7 +112,61 @@ public class LandCoin extends JavaPlugin implements Listener {
         registerCommand("land", new LandCommand());
         registerCommand("selection", new SelectionCommand());
 
+        // Iniciar task para verificar integridade das sub-áreas
+        startSubAreaValidationTask();
+
         getLogger().info("LandCoin v" + getDescription().getVersion() + " enabled successfully!");
+    }
+
+    private void startSubAreaValidationTask() {
+        new BukkitRunnable() {
+            @Override
+            public void run() {
+                validateAllSubAreas();
+            }
+        }.runTaskTimer(this, 1200L, 6000L); // Verificar a cada 5 minutos
+    }
+
+    private void validateAllSubAreas() {
+        Set<SubArea> toRemove = new HashSet<>();
+        
+        for (SubArea area : dataManager.getSubAreas()) {
+            UUID owner = null;
+            boolean valid = true;
+            
+            for (String chunkKey : area.getChunkKeys()) {
+                Land land = dataManager.getLand(chunkKey);
+                if (land == null) {
+                    valid = false;
+                    break;
+                }
+                if (owner == null) {
+                    owner = land.getOwner();
+                } else if (!land.getOwner().equals(owner)) {
+                    valid = false;
+                    break;
+                }
+            }
+            
+            if (!valid) {
+                toRemove.add(area);
+            }
+        }
+        
+        for (SubArea area : toRemove) {
+            for (String chunkKey : area.getChunkKeys()) {
+                Land land = dataManager.getLand(chunkKey);
+                if (land != null) {
+                    land.removeSubArea(area.getId());
+                }
+            }
+            dataManager.removeSubArea(area.getId());
+        }
+        
+        if (!toRemove.isEmpty()) {
+            dataManager.saveAll();
+            getLogger().info("Removed " + toRemove.size() + " invalid sub-areas");
+        }
     }
 
     private void registerCommand(String name, CommandExecutor executor) {
@@ -194,7 +256,7 @@ public class LandCoin extends JavaPlugin implements Listener {
     }
 
     public enum Role {
-        OWNER, ASSIST, TRUST, MEMBER, RENT, BUYER, NONE
+        OWNER, ASSIST, TRUST, MEMBER, RENT, BUYER, UNTRUSTED, NONE
     }
 
     public enum PermissionType {
@@ -853,6 +915,11 @@ public class LandCoin extends JavaPlugin implements Listener {
         private boolean buyerBlockPlace = true;
         private boolean buyerAccess = true;
         private boolean buyerUse = true;
+        
+        private boolean untrustedBlockBreak = false;
+        private boolean untrustedBlockPlace = false;
+        private boolean untrustedAccess = false;
+        private boolean untrustedUse = false;
 
         public boolean canBreak(Role role) {
             switch (role) {
@@ -862,6 +929,7 @@ public class LandCoin extends JavaPlugin implements Listener {
                 case MEMBER: return memberBlockBreak;
                 case RENT: return rentBlockBreak;
                 case BUYER: return buyerBlockBreak;
+                case UNTRUSTED: return untrustedBlockBreak;
                 default: return false;
             }
         }
@@ -874,6 +942,7 @@ public class LandCoin extends JavaPlugin implements Listener {
                 case MEMBER: return memberBlockPlace;
                 case RENT: return rentBlockPlace;
                 case BUYER: return buyerBlockPlace;
+                case UNTRUSTED: return untrustedBlockPlace;
                 default: return false;
             }
         }
@@ -886,6 +955,7 @@ public class LandCoin extends JavaPlugin implements Listener {
                 case MEMBER: return memberAccess;
                 case RENT: return rentAccess;
                 case BUYER: return buyerAccess;
+                case UNTRUSTED: return untrustedAccess;
                 default: return false;
             }
         }
@@ -898,6 +968,7 @@ public class LandCoin extends JavaPlugin implements Listener {
                 case MEMBER: return memberUse;
                 case RENT: return rentUse;
                 case BUYER: return buyerUse;
+                case UNTRUSTED: return untrustedUse;
                 default: return false;
             }
         }
@@ -952,6 +1023,14 @@ public class LandCoin extends JavaPlugin implements Listener {
                         case USE: buyerUse = value; break;
                     }
                     break;
+                case UNTRUSTED:
+                    switch (type) {
+                        case BREAK: untrustedBlockBreak = value; break;
+                        case PLACE: untrustedBlockPlace = value; break;
+                        case ACCESS: untrustedAccess = value; break;
+                        case USE: untrustedUse = value; break;
+                    }
+                    break;
                 default:
                     break;
             }
@@ -982,6 +1061,10 @@ public class LandCoin extends JavaPlugin implements Listener {
             oos.writeBoolean(buyerBlockPlace);
             oos.writeBoolean(buyerAccess);
             oos.writeBoolean(buyerUse);
+            oos.writeBoolean(untrustedBlockBreak);
+            oos.writeBoolean(untrustedBlockPlace);
+            oos.writeBoolean(untrustedAccess);
+            oos.writeBoolean(untrustedUse);
         }
 
         public void deserialize(ObjectInputStream ois) throws IOException {
@@ -1009,6 +1092,17 @@ public class LandCoin extends JavaPlugin implements Listener {
             buyerBlockPlace = ois.readBoolean();
             buyerAccess = ois.readBoolean();
             buyerUse = ois.readBoolean();
+            try {
+                untrustedBlockBreak = ois.readBoolean();
+                untrustedBlockPlace = ois.readBoolean();
+                untrustedAccess = ois.readBoolean();
+                untrustedUse = ois.readBoolean();
+            } catch (EOFException e) {
+                untrustedBlockBreak = false;
+                untrustedBlockPlace = false;
+                untrustedAccess = false;
+                untrustedUse = false;
+            }
         }
     }
 
@@ -1068,11 +1162,16 @@ public class LandCoin extends JavaPlugin implements Listener {
         public Map<UUID, Role> getMemberRoles() { return memberRoles; }
 
         public Role getRole(UUID playerId) {
-            return memberRoles.getOrDefault(playerId, Role.NONE);
+            if (playerId.equals(owner)) return Role.OWNER;
+            return memberRoles.getOrDefault(playerId, Role.UNTRUSTED);
         }
 
         public void setRole(UUID playerId, Role role) {
-            memberRoles.put(playerId, role);
+            if (role == Role.UNTRUSTED) {
+                memberRoles.remove(playerId);
+            } else {
+                memberRoles.put(playerId, role);
+            }
         }
 
         public void removeMember(UUID playerId) {
@@ -1191,6 +1290,7 @@ public class LandCoin extends JavaPlugin implements Listener {
         private final Permissions permissions;
         private final Map<UUID, Role> memberRoles = new ConcurrentHashMap<>();
         private final Map<UUID, Long> lastEntryTimes = new ConcurrentHashMap<>();
+        private final Map<UUID, Long> lastNotificationTimes = new ConcurrentHashMap<>();
 
         public SubArea(String id, World world, Location pos1, Location pos2) {
             this.id = id;
@@ -1232,11 +1332,15 @@ public class LandCoin extends JavaPlugin implements Listener {
         public Map<UUID, Long> getLastEntryTimes() { return lastEntryTimes; }
 
         public Role getRole(UUID playerId) {
-            return memberRoles.getOrDefault(playerId, Role.NONE);
+            return memberRoles.getOrDefault(playerId, Role.UNTRUSTED);
         }
 
         public void setRole(UUID playerId, Role role) {
-            memberRoles.put(playerId, role);
+            if (role == Role.UNTRUSTED) {
+                memberRoles.remove(playerId);
+            } else {
+                memberRoles.put(playerId, role);
+            }
         }
 
         public void removeMember(UUID playerId) {
@@ -1271,8 +1375,14 @@ public class LandCoin extends JavaPlugin implements Listener {
         }
         
         public boolean shouldNotifyEntry(UUID playerId) {
-            Long lastEntry = lastEntryTimes.get(playerId);
-            return lastEntry == null || (System.currentTimeMillis() - lastEntry) > 5000;
+            Long lastNotification = lastNotificationTimes.get(playerId);
+            long now = System.currentTimeMillis();
+            
+            if (lastNotification == null || (now - lastNotification) > 2000) {
+                lastNotificationTimes.put(playerId, now);
+                return true;
+            }
+            return false;
         }
 
         public void serialize(ObjectOutputStream oos) throws IOException {
@@ -1300,6 +1410,12 @@ public class LandCoin extends JavaPlugin implements Listener {
             
             oos.writeInt(lastEntryTimes.size());
             for (Map.Entry<UUID, Long> e : lastEntryTimes.entrySet()) {
+                oos.writeObject(e.getKey().toString());
+                oos.writeLong(e.getValue());
+            }
+            
+            oos.writeInt(lastNotificationTimes.size());
+            for (Map.Entry<UUID, Long> e : lastNotificationTimes.entrySet()) {
                 oos.writeObject(e.getKey().toString());
                 oos.writeLong(e.getValue());
             }
@@ -1347,6 +1463,13 @@ public class LandCoin extends JavaPlugin implements Listener {
                     long time = ois.readLong();
                     area.lastEntryTimes.put(uuid, time);
                 }
+                
+                int notifCount = ois.readInt();
+                for (int i = 0; i < notifCount; i++) {
+                    UUID uuid = UUID.fromString((String) ois.readObject());
+                    long time = ois.readLong();
+                    area.lastNotificationTimes.put(uuid, time);
+                }
             } catch (EOFException e) {
             }
             
@@ -1385,11 +1508,7 @@ public class LandCoin extends JavaPlugin implements Listener {
             }
 
             Role role = land.getRole(player.getUniqueId());
-            if (role != Role.NONE) {
-                return land.getPermissions().canBreak(role);
-            }
-
-            return false;
+            return land.getPermissions().canBreak(role);
         }
 
         public boolean canPlace(Player player, Location loc) {
@@ -1407,11 +1526,7 @@ public class LandCoin extends JavaPlugin implements Listener {
             }
 
             Role role = land.getRole(player.getUniqueId());
-            if (role != Role.NONE) {
-                return land.getPermissions().canPlace(role);
-            }
-
-            return false;
+            return land.getPermissions().canPlace(role);
         }
 
         public boolean canAccess(Player player, Location loc) {
@@ -1429,11 +1544,7 @@ public class LandCoin extends JavaPlugin implements Listener {
             }
 
             Role role = land.getRole(player.getUniqueId());
-            if (role != Role.NONE) {
-                return land.getPermissions().canAccess(role);
-            }
-
-            return false;
+            return land.getPermissions().canAccess(role);
         }
 
         public boolean canUse(Player player, Location loc) {
@@ -1451,11 +1562,11 @@ public class LandCoin extends JavaPlugin implements Listener {
             }
 
             Role role = land.getRole(player.getUniqueId());
-            if (role != Role.NONE) {
-                return land.getPermissions().canUse(role);
-            }
+            return land.getPermissions().canUse(role);
+        }
 
-            return false;
+        public boolean canUseBucket(Player player, Location loc) {
+            return canPlace(player, loc) || canBuild(player, loc);
         }
 
         public boolean claimLand(Player player, SelectionManager.Selection sel) {
@@ -1794,7 +1905,7 @@ public class LandCoin extends JavaPlugin implements Listener {
             }
             
             if (role == Role.OWNER || role == Role.NONE) {
-                player.sendMessage(ChatColor.RED + "Invalid role! Choose ASSIST, TRUST, or MEMBER.");
+                player.sendMessage(ChatColor.RED + "Invalid role! Choose ASSIST, TRUST, MEMBER, or UNTRUSTED.");
                 return;
             }
 
@@ -1806,7 +1917,11 @@ public class LandCoin extends JavaPlugin implements Listener {
             
             Player target = Bukkit.getPlayer(targetUUID);
             if (target != null && target.isOnline()) {
-                target.sendMessage(ChatColor.GREEN + "You now have role " + role + " in " + player.getName() + "'s land");
+                if (role == Role.UNTRUSTED) {
+                    target.sendMessage(ChatColor.RED + "You are now untrusted in " + player.getName() + "'s land");
+                } else {
+                    target.sendMessage(ChatColor.GREEN + "You now have role " + role + " in " + player.getName() + "'s land");
+                }
             }
         }
 
@@ -1850,7 +1965,11 @@ public class LandCoin extends JavaPlugin implements Listener {
                 
                 Player target = Bukkit.getPlayer(targetUUID);
                 if (target != null && target.isOnline()) {
-                    target.sendMessage(ChatColor.GREEN + "You now have role " + role + " in " + count + " lands owned by " + player.getName());
+                    if (role == Role.UNTRUSTED) {
+                        target.sendMessage(ChatColor.RED + "You are now untrusted in " + count + " lands owned by " + player.getName());
+                    } else {
+                        target.sendMessage(ChatColor.GREEN + "You now have role " + role + " in " + count + " lands owned by " + player.getName());
+                    }
                 }
             } else {
                 player.sendMessage(ChatColor.YELLOW + "No eligible lands found in selection");
@@ -2092,6 +2211,20 @@ public class LandCoin extends JavaPlugin implements Listener {
             return true;
         }
 
+        public void setSubAreaPermissions(Player player, SubArea area, Role role, PermissionType perm, boolean value) {
+            for (String chunkKey : area.getChunkKeys()) {
+                Land land = plugin.getDataManager().getLand(chunkKey);
+                if (land == null || (!land.getOwner().equals(player.getUniqueId()) && !player.hasPermission("landcoin.admin"))) {
+                    player.sendMessage(ChatColor.RED + "You don't own all lands containing this sub-area!");
+                    return;
+                }
+            }
+
+            area.getPermissions().setPermission(role, perm, value);
+            plugin.getDataManager().saveAll();
+            player.sendMessage(ChatColor.GREEN + "Set permission " + perm + " to " + value + " for role " + role + " in this sub-area");
+        }
+
         public void unclaimSubArea(Player player, SubArea area) {
             for (String chunkKey : area.getChunkKeys()) {
                 Land land = plugin.getDataManager().getLand(chunkKey);
@@ -2241,7 +2374,7 @@ public class LandCoin extends JavaPlugin implements Listener {
             }
             
             if (role == Role.OWNER || role == Role.NONE || role == Role.RENT || role == Role.BUYER) {
-                player.sendMessage(ChatColor.RED + "Invalid role! Choose ASSIST, TRUST, or MEMBER.");
+                player.sendMessage(ChatColor.RED + "Invalid role! Choose ASSIST, TRUST, MEMBER, or UNTRUSTED.");
                 return;
             }
 
@@ -2253,7 +2386,11 @@ public class LandCoin extends JavaPlugin implements Listener {
             
             Player target = Bukkit.getPlayer(targetUUID);
             if (target != null && target.isOnline()) {
-                target.sendMessage(ChatColor.GREEN + "You now have role " + role + " in a sub-area owned by " + player.getName());
+                if (role == Role.UNTRUSTED) {
+                    target.sendMessage(ChatColor.RED + "You are now untrusted in a sub-area owned by " + player.getName());
+                } else {
+                    target.sendMessage(ChatColor.GREEN + "You now have role " + role + " in a sub-area owned by " + player.getName());
+                }
             }
         }
 
@@ -2705,6 +2842,7 @@ public class LandCoin extends JavaPlugin implements Listener {
             player.sendMessage(ChatColor.YELLOW + "/land area claim <name> " + ChatColor.GRAY + "- Create sub-area");
             player.sendMessage(ChatColor.YELLOW + "/land area unclaim " + ChatColor.GRAY + "- Delete sub-area");
             player.sendMessage(ChatColor.YELLOW + "/land set <role> <break/place/access/use> <true/false> " + ChatColor.GRAY + "- Set permissions in selection");
+            player.sendMessage(ChatColor.YELLOW + "/land area set <role> <break/place/access/use> <true/false> " + ChatColor.GRAY + "- Set permissions in sub-area");
             player.sendMessage(ChatColor.YELLOW + "/land rent " + ChatColor.GRAY + "- Rent current land");
             player.sendMessage(ChatColor.YELLOW + "/land area rent " + ChatColor.GRAY + "- Rent current sub-area");
             player.sendMessage(ChatColor.YELLOW + "/land unrent [all/area] " + ChatColor.GRAY + "- Stop renting");
@@ -2746,7 +2884,7 @@ public class LandCoin extends JavaPlugin implements Listener {
 
         private boolean handleArea(Player player, String[] args) {
             if (args.length < 2) {
-                player.sendMessage(ChatColor.RED + "Usage: /land area <claim/unclaim/rental/rent/unrent/trust/untrust>");
+                player.sendMessage(ChatColor.RED + "Usage: /land area <claim/unclaim/set/rental/rent/unrent/trust/untrust>");
                 return true;
             }
 
@@ -2772,6 +2910,29 @@ public class LandCoin extends JavaPlugin implements Listener {
                         return true;
                     }
                     subAreaManager.unclaimSubArea(player, area);
+                    return true;
+
+                case "set":
+                    if (args.length < 5) {
+                        player.sendMessage(ChatColor.RED + "Usage: /land area set <role> <break/place/access/use> <true/false>");
+                        return true;
+                    }
+                    
+                    SubArea areaToSet = subAreaManager.getSubAreaAt(player.getLocation());
+                    if (areaToSet == null) {
+                        player.sendMessage(ChatColor.RED + "You are not in a sub-area!");
+                        return true;
+                    }
+                    
+                    try {
+                        Role role = Role.valueOf(args[2].toUpperCase());
+                        PermissionType perm = PermissionType.valueOf(args[3].toUpperCase());
+                        boolean value = Boolean.parseBoolean(args[4]);
+                        
+                        subAreaManager.setSubAreaPermissions(player, areaToSet, role, perm, value);
+                    } catch (IllegalArgumentException e) {
+                        player.sendMessage(ChatColor.RED + "Invalid role or permission type! Available roles: OWNER, ASSIST, TRUST, MEMBER, RENT, BUYER, UNTRUSTED");
+                    }
                     return true;
 
                 case "rental":
@@ -2831,7 +2992,7 @@ public class LandCoin extends JavaPlugin implements Listener {
                         try {
                             role = Role.valueOf(args[3].toUpperCase());
                         } catch (IllegalArgumentException e) {
-                            player.sendMessage(ChatColor.RED + "Invalid role! Use ASSIST, TRUST, or MEMBER.");
+                            player.sendMessage(ChatColor.RED + "Invalid role! Use ASSIST, TRUST, MEMBER, or UNTRUSTED.");
                             return true;
                         }
                     }
@@ -2878,7 +3039,7 @@ public class LandCoin extends JavaPlugin implements Listener {
                 landManager.setPermissionsInSelection(player, sel, role, perm, value);
                 
             } catch (IllegalArgumentException e) {
-                player.sendMessage(ChatColor.RED + "Invalid role or permission type!");
+                player.sendMessage(ChatColor.RED + "Invalid role or permission type! Available roles: OWNER, ASSIST, TRUST, MEMBER, RENT, BUYER, UNTRUSTED");
             }
             return true;
         }
@@ -3084,7 +3245,7 @@ public class LandCoin extends JavaPlugin implements Listener {
                     try {
                         role = Role.valueOf(args[3].toUpperCase());
                     } catch (IllegalArgumentException e) {
-                        player.sendMessage(ChatColor.RED + "Invalid role! Use ASSIST, TRUST, or MEMBER.");
+                        player.sendMessage(ChatColor.RED + "Invalid role! Use ASSIST, TRUST, MEMBER, or UNTRUSTED.");
                         return true;
                     }
                 }
@@ -3104,7 +3265,7 @@ public class LandCoin extends JavaPlugin implements Listener {
                     try {
                         role = Role.valueOf(args[2].toUpperCase());
                     } catch (IllegalArgumentException e) {
-                        player.sendMessage(ChatColor.RED + "Invalid role! Use ASSIST, TRUST, or MEMBER.");
+                        player.sendMessage(ChatColor.RED + "Invalid role! Use ASSIST, TRUST, MEMBER, or UNTRUSTED.");
                         return true;
                     }
                 }
@@ -3237,7 +3398,7 @@ public class LandCoin extends JavaPlugin implements Listener {
                         landManager.setPermissionsInSelection(player, sel, role, perm, value);
                         
                     } catch (IllegalArgumentException e) {
-                        player.sendMessage(ChatColor.RED + "Invalid role or permission type!");
+                        player.sendMessage(ChatColor.RED + "Invalid role or permission type! Available roles: OWNER, ASSIST, TRUST, MEMBER, RENT, BUYER, UNTRUSTED");
                     }
                     return true;
 
@@ -3295,7 +3456,7 @@ public class LandCoin extends JavaPlugin implements Listener {
             if (args.length == 2) {
                 String sub = args[0].toLowerCase();
                 if (sub.equals("area")) {
-                    completions.addAll(Arrays.asList("claim", "unclaim", "rental", "rent", "unrent", "trust", "untrust"));
+                    completions.addAll(Arrays.asList("claim", "unclaim", "set", "rental", "rent", "unrent", "trust", "untrust"));
                 }
                 if (sub.equals("set")) {
                     completions.addAll(Arrays.stream(Role.values())
@@ -3348,11 +3509,18 @@ public class LandCoin extends JavaPlugin implements Listener {
                     }
                     completions.addAll(Arrays.stream(Role.values())
                             .map(Enum::name)
-                            .filter(r -> r.equals("ASSIST") || r.equals("TRUST") || r.equals("MEMBER"))
+                            .filter(r -> r.equals("ASSIST") || r.equals("TRUST") || r.equals("MEMBER") || r.equals("UNTRUSTED"))
                             .collect(Collectors.toList()));
                     return filter(completions, args[2]);
                 }
                 if (sub.equals("area")) {
+                    if (args[1].equalsIgnoreCase("set")) {
+                        completions.addAll(Arrays.stream(Role.values())
+                                .map(Enum::name)
+                                .filter(r -> !r.equals("NONE"))
+                                .collect(Collectors.toList()));
+                        return filter(completions, args[2]);
+                    }
                     if (args[1].equalsIgnoreCase("trust") || args[1].equalsIgnoreCase("untrust")) {
                         completions.addAll(getAllPlayerNames());
                         return filter(completions, args[2]);
@@ -3378,22 +3546,35 @@ public class LandCoin extends JavaPlugin implements Listener {
                 if (sub.equals("trust") && !args[1].equalsIgnoreCase("area")) {
                     completions.addAll(Arrays.stream(Role.values())
                             .map(Enum::name)
-                            .filter(r -> r.equals("ASSIST") || r.equals("TRUST") || r.equals("MEMBER"))
+                            .filter(r -> r.equals("ASSIST") || r.equals("TRUST") || r.equals("MEMBER") || r.equals("UNTRUSTED"))
                             .collect(Collectors.toList()));
                     return filter(completions, args[3]);
                 }
-                if (sub.equals("area") && args[1].equalsIgnoreCase("trust")) {
-                    completions.addAll(Arrays.stream(Role.values())
-                            .map(Enum::name)
-                            .filter(r -> r.equals("ASSIST") || r.equals("TRUST") || r.equals("MEMBER"))
-                            .collect(Collectors.toList()));
-                    return filter(completions, args[3]);
+                if (sub.equals("area")) {
+                    if (args[1].equalsIgnoreCase("set")) {
+                        completions.addAll(Arrays.stream(PermissionType.values())
+                                .map(Enum::name)
+                                .map(String::toLowerCase)
+                                .collect(Collectors.toList()));
+                        return filter(completions, args[3]);
+                    }
+                    if (args[1].equalsIgnoreCase("trust")) {
+                        completions.addAll(Arrays.stream(Role.values())
+                                .map(Enum::name)
+                                .filter(r -> r.equals("ASSIST") || r.equals("TRUST") || r.equals("MEMBER") || r.equals("UNTRUSTED"))
+                                .collect(Collectors.toList()));
+                        return filter(completions, args[3]);
+                    }
                 }
             }
 
             if (args.length == 5) {
                 String sub = args[0].toLowerCase();
                 if (sub.equals("admin") && args[1].equalsIgnoreCase("set")) {
+                    completions.addAll(Arrays.asList("true", "false"));
+                    return filter(completions, args[4]);
+                }
+                if (sub.equals("area") && args[1].equalsIgnoreCase("set")) {
                     completions.addAll(Arrays.asList("true", "false"));
                     return filter(completions, args[4]);
                 }
@@ -3497,6 +3678,44 @@ public class LandCoin extends JavaPlugin implements Listener {
         if (!landManager.canPlace(player, event.getBlock().getLocation())) {
             event.setCancelled(true);
             player.sendMessage(ChatColor.RED + "You don't have permission to place blocks here!");
+        }
+    }
+
+    @EventHandler(priority = EventPriority.HIGH)
+    public void onPlayerBucketEmpty(PlayerBucketEmptyEvent event) {
+        Player player = event.getPlayer();
+        if (!landManager.canUseBucket(player, event.getBlock().getLocation())) {
+            event.setCancelled(true);
+            player.sendMessage(ChatColor.RED + "You don't have permission to place liquids here!");
+        }
+    }
+
+    @EventHandler(priority = EventPriority.HIGH)
+    public void onPlayerBucketFill(PlayerBucketFillEvent event) {
+        Player player = event.getPlayer();
+        if (!landManager.canUseBucket(player, event.getBlock().getLocation())) {
+            event.setCancelled(true);
+            player.sendMessage(ChatColor.RED + "You don't have permission to take liquids here!");
+        }
+    }
+
+    @EventHandler(priority = EventPriority.HIGH)
+    public void onProjectileHit(ProjectileHitEvent event) {
+        // Verificar se é uma WindCharge pelo nome (compatibilidade com versões)
+        if (event.getEntity().getType().name().equals("WIND_CHARGE") && event.getHitBlock() != null) {
+            Location loc = event.getHitBlock().getLocation();
+            
+            // Check if the hit block is in protected land
+            Land land = landManager.getLandAt(loc);
+            if (land != null) {
+                // Cancel wind charge interaction with doors/gates in protected land
+                Material type = event.getHitBlock().getType();
+                String typeName = type.name();
+                if (typeName.contains("DOOR") || typeName.contains("GATE") || 
+                    typeName.contains("TRAPDOOR") || typeName.contains("FENCE_GATE")) {
+                    event.setCancelled(true);
+                }
+            }
         }
     }
 
