@@ -75,7 +75,7 @@ public class LandCoin extends JavaPlugin implements Listener {
     private Economy economy;
     
     // Mapa para rastrear últimas notificações de sub-área por jogador
-    private final Map<UUID, String> lastSubAreaNotification = new ConcurrentHashMap<>();
+    private final Map<UUID, String> playerCurrentSubArea = new ConcurrentHashMap<>();
     private final Map<UUID, Long> lastSubAreaNotificationTime = new ConcurrentHashMap<>();
 
     @Override
@@ -1290,7 +1290,6 @@ public class LandCoin extends JavaPlugin implements Listener {
         private final Permissions permissions;
         private final Map<UUID, Role> memberRoles = new ConcurrentHashMap<>();
         private final Map<UUID, Long> lastEntryTimes = new ConcurrentHashMap<>();
-        private final Map<UUID, Long> lastNotificationTimes = new ConcurrentHashMap<>();
 
         public SubArea(String id, World world, Location pos1, Location pos2) {
             this.id = id;
@@ -1374,15 +1373,8 @@ public class LandCoin extends JavaPlugin implements Listener {
             lastEntryTimes.put(playerId, System.currentTimeMillis());
         }
         
-        public boolean shouldNotifyEntry(UUID playerId) {
-            Long lastNotification = lastNotificationTimes.get(playerId);
-            long now = System.currentTimeMillis();
-            
-            if (lastNotification == null || (now - lastNotification) > 2000) {
-                lastNotificationTimes.put(playerId, now);
-                return true;
-            }
-            return false;
+        public long getLastEntryTime(UUID playerId) {
+            return lastEntryTimes.getOrDefault(playerId, 0L);
         }
 
         public void serialize(ObjectOutputStream oos) throws IOException {
@@ -1410,12 +1402,6 @@ public class LandCoin extends JavaPlugin implements Listener {
             
             oos.writeInt(lastEntryTimes.size());
             for (Map.Entry<UUID, Long> e : lastEntryTimes.entrySet()) {
-                oos.writeObject(e.getKey().toString());
-                oos.writeLong(e.getValue());
-            }
-            
-            oos.writeInt(lastNotificationTimes.size());
-            for (Map.Entry<UUID, Long> e : lastNotificationTimes.entrySet()) {
                 oos.writeObject(e.getKey().toString());
                 oos.writeLong(e.getValue());
             }
@@ -1462,13 +1448,6 @@ public class LandCoin extends JavaPlugin implements Listener {
                     UUID uuid = UUID.fromString((String) ois.readObject());
                     long time = ois.readLong();
                     area.lastEntryTimes.put(uuid, time);
-                }
-                
-                int notifCount = ois.readInt();
-                for (int i = 0; i < notifCount; i++) {
-                    UUID uuid = UUID.fromString((String) ois.readObject());
-                    long time = ois.readLong();
-                    area.lastNotificationTimes.put(uuid, time);
                 }
             } catch (EOFException e) {
             }
@@ -2181,8 +2160,9 @@ public class LandCoin extends JavaPlugin implements Listener {
                 return false;
             }
 
+            // Verificar se o jogador é o dono da land ou tem permissão de admin
             if (!owner.equals(player.getUniqueId()) && !player.hasPermission("landcoin.admin")) {
-                player.sendMessage(ChatColor.RED + "You don't own these lands!");
+                player.sendMessage(ChatColor.RED + "Only the land owner can create sub-areas!");
                 return false;
             }
 
@@ -3789,6 +3769,7 @@ public class LandCoin extends JavaPlugin implements Listener {
 
         Player player = event.getPlayer();
         
+        // Verificar mudança de chunks (lands)
         if (!event.getFrom().getChunk().equals(event.getTo().getChunk())) {
             Land fromLand = landManager.getLandAt(event.getFrom());
             Land toLand = landManager.getLandAt(event.getTo());
@@ -3814,27 +3795,27 @@ public class LandCoin extends JavaPlugin implements Listener {
             }
         }
 
-        SubArea fromArea = subAreaManager.getSubAreaAt(event.getFrom());
-        SubArea toArea = subAreaManager.getSubAreaAt(event.getTo());
-
-        if (fromArea == null && toArea != null) {
-            if (toArea.shouldNotifyEntry(player.getUniqueId())) {
+        // Verificar entrada/saída de sub-áreas
+        SubArea currentArea = subAreaManager.getSubAreaAt(event.getTo());
+        String previousAreaId = playerCurrentSubArea.get(player.getUniqueId());
+        
+        if (currentArea == null && previousAreaId != null) {
+            // Saiu de uma sub-área
+            player.sendMessage(ChatColor.AQUA + "Leaving sub-area");
+            playerCurrentSubArea.remove(player.getUniqueId());
+        } else if (currentArea != null) {
+            String currentAreaId = currentArea.getId();
+            if (previousAreaId == null) {
+                // Entrou em uma sub-área
                 player.sendMessage(ChatColor.AQUA + "Entering sub-area");
-                toArea.recordEntry(player.getUniqueId());
-            }
-        } else if (fromArea != null && toArea == null) {
-            if (fromArea.shouldNotifyEntry(player.getUniqueId())) {
+                playerCurrentSubArea.put(player.getUniqueId(), currentAreaId);
+                currentArea.recordEntry(player.getUniqueId());
+            } else if (!previousAreaId.equals(currentAreaId)) {
+                // Mudou de uma sub-área para outra
                 player.sendMessage(ChatColor.AQUA + "Leaving sub-area");
-                fromArea.recordEntry(player.getUniqueId());
-            }
-        } else if (fromArea != null && toArea != null && !fromArea.getId().equals(toArea.getId())) {
-            if (fromArea.shouldNotifyEntry(player.getUniqueId())) {
-                player.sendMessage(ChatColor.AQUA + "Leaving sub-area");
-                fromArea.recordEntry(player.getUniqueId());
-            }
-            if (toArea.shouldNotifyEntry(player.getUniqueId())) {
                 player.sendMessage(ChatColor.AQUA + "Entering sub-area");
-                toArea.recordEntry(player.getUniqueId());
+                playerCurrentSubArea.put(player.getUniqueId(), currentAreaId);
+                currentArea.recordEntry(player.getUniqueId());
             }
         }
     }
@@ -3888,5 +3869,6 @@ public class LandCoin extends JavaPlugin implements Listener {
     @EventHandler
     public void onPlayerQuit(PlayerQuitEvent event) {
         selectionManager.clearSelection(event.getPlayer().getUniqueId());
+        playerCurrentSubArea.remove(event.getPlayer().getUniqueId());
     }
 }
