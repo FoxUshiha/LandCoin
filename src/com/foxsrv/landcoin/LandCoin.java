@@ -45,6 +45,8 @@ import java.text.DecimalFormat;
 import java.text.DecimalFormatSymbols;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Level;
 import java.util.stream.Collectors;
@@ -52,6 +54,8 @@ import java.util.stream.Collectors;
 public class LandCoin extends JavaPlugin implements Listener {
 
     private static final DecimalFormat COIN_FORMAT;
+    private static final ScheduledExecutorService ASYNC_EXECUTOR = Executors.newScheduledThreadPool(4);
+    private static final ExecutorService SAVE_EXECUTOR = Executors.newSingleThreadExecutor();
 
     static {
         DecimalFormatSymbols symbols = new DecimalFormatSymbols(Locale.US);
@@ -74,9 +78,9 @@ public class LandCoin extends JavaPlugin implements Listener {
     private CoinCardAPI coinCardAPI;
     private Economy economy;
     
-    // Mapa para rastrear últimas notificações de sub-área por jogador
     private final Map<UUID, String> playerCurrentSubArea = new ConcurrentHashMap<>();
     private final Map<UUID, Long> lastSubAreaNotificationTime = new ConcurrentHashMap<>();
+    private final AtomicBoolean isSaving = new AtomicBoolean(false);
 
     @Override
     public void onEnable() {
@@ -103,19 +107,24 @@ public class LandCoin extends JavaPlugin implements Listener {
         this.taxManager = new TaxManager(this);
         this.rentalManager = new RentalManager(this);
 
-        this.dataManager.loadAll();
-        this.taxManager.startTimer();
-        this.rentalManager.startTimer();
-
-        getServer().getPluginManager().registerEvents(this, this);
-
-        registerCommand("land", new LandCommand());
-        registerCommand("selection", new SelectionCommand());
-
-        // Iniciar task para verificar integridade das sub-áreas
-        startSubAreaValidationTask();
-
-        getLogger().info("LandCoin v" + getDescription().getVersion() + " enabled successfully!");
+        // Load data asynchronously
+        CompletableFuture.runAsync(() -> {
+            this.dataManager.loadAll();
+            getLogger().info("Data loaded asynchronously");
+        }, ASYNC_EXECUTOR).thenRun(() -> {
+            new BukkitRunnable() {
+                @Override
+                public void run() {
+                    taxManager.startTimer();
+                    rentalManager.startTimer();
+                    getServer().getPluginManager().registerEvents(LandCoin.this, LandCoin.this);
+                    registerCommand("land", new LandCommand());
+                    registerCommand("selection", new SelectionCommand());
+                    startSubAreaValidationTask();
+                    getLogger().info("LandCoin v" + getDescription().getVersion() + " enabled successfully!");
+                }
+            }.runTask(this);
+        });
     }
 
     private void startSubAreaValidationTask() {
@@ -124,7 +133,7 @@ public class LandCoin extends JavaPlugin implements Listener {
             public void run() {
                 validateAllSubAreas();
             }
-        }.runTaskTimer(this, 1200L, 6000L); // Verificar a cada 5 minutos
+        }.runTaskTimerAsynchronously(this, 1200L, 6000L);
     }
 
     private void validateAllSubAreas() {
@@ -153,18 +162,17 @@ public class LandCoin extends JavaPlugin implements Listener {
             }
         }
         
-        for (SubArea area : toRemove) {
-            for (String chunkKey : area.getChunkKeys()) {
-                Land land = dataManager.getLand(chunkKey);
-                if (land != null) {
-                    land.removeSubArea(area.getId());
-                }
-            }
-            dataManager.removeSubArea(area.getId());
-        }
-        
         if (!toRemove.isEmpty()) {
-            dataManager.saveAll();
+            for (SubArea area : toRemove) {
+                for (String chunkKey : area.getChunkKeys()) {
+                    Land land = dataManager.getLand(chunkKey);
+                    if (land != null) {
+                        land.removeSubArea(area.getId());
+                    }
+                }
+                dataManager.removeSubArea(area.getId());
+            }
+            dataManager.saveAllAsync();
             getLogger().info("Removed " + toRemove.size() + " invalid sub-areas");
         }
     }
@@ -196,7 +204,15 @@ public class LandCoin extends JavaPlugin implements Listener {
         if (taxManager != null) taxManager.stopTimer();
         if (rentalManager != null) rentalManager.stopTimer();
         if (transactionQueue != null) transactionQueue.shutdown();
-        if (dataManager != null) dataManager.saveAll();
+        if (dataManager != null) dataManager.saveAllSync();
+        ASYNC_EXECUTOR.shutdown();
+        SAVE_EXECUTOR.shutdown();
+        try {
+            ASYNC_EXECUTOR.awaitTermination(5, TimeUnit.SECONDS);
+            SAVE_EXECUTOR.awaitTermination(5, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            getLogger().warning("Timeout waiting for executors to shutdown");
+        }
         getLogger().info("LandCoin disabled.");
     }
 
@@ -239,6 +255,7 @@ public class LandCoin extends JavaPlugin implements Listener {
     public TransactionQueue getTransactionQueue() { return transactionQueue; }
     public TaxManager getTaxManager() { return taxManager; }
     public RentalManager getRentalManager() { return rentalManager; }
+    public static ScheduledExecutorService getAsyncExecutor() { return ASYNC_EXECUTOR; }
 
     public static String formatCoin(double amount) {
         return formatCoin(BigDecimal.valueOf(amount));
@@ -308,12 +325,12 @@ public class LandCoin extends JavaPlugin implements Listener {
     public static class RentalManager {
         private final LandCoin plugin;
         private BukkitTask rentalTask;
-        private long lastRentalTime;
-        private final List<PendingNotification> pendingNotifications = new ArrayList<>();
+        private final AtomicLong lastRentalTime = new AtomicLong();
+        private final List<PendingNotification> pendingNotifications = new CopyOnWriteArrayList<>();
 
         public RentalManager(LandCoin plugin) {
             this.plugin = plugin;
-            this.lastRentalTime = System.currentTimeMillis();
+            this.lastRentalTime.set(System.currentTimeMillis());
         }
 
         public void startTimer() {
@@ -322,7 +339,7 @@ public class LandCoin extends JavaPlugin implements Listener {
                 public void run() {
                     checkRentals();
                 }
-            }.runTaskTimer(plugin, 1200L, 600L);
+            }.runTaskTimerAsynchronously(plugin, 1200L, 600L);
         }
 
         public void stopTimer() {
@@ -330,15 +347,15 @@ public class LandCoin extends JavaPlugin implements Listener {
         }
 
         public void forceProcessNextDay() {
-            lastRentalTime = 0;
+            lastRentalTime.set(0);
             checkRentals();
         }
 
         private void checkRentals() {
             long now = System.currentTimeMillis();
-            if (now - lastRentalTime < 86400000L) return;
+            if (now - lastRentalTime.get() < 86400000L) return;
 
-            lastRentalTime = now;
+            lastRentalTime.set(now);
             processRentals();
         }
 
@@ -349,36 +366,39 @@ public class LandCoin extends JavaPlugin implements Listener {
                 return;
             }
 
-            for (Land land : plugin.getDataManager().getLands()) {
-                UUID renterId = land.getRenter();
-                if (renterId != null) {
-                    double price = land.getRentalPrice();
-                    double tax = price * plugin.getConfigManager().getTaxPercentForRent();
-                    double total = price + tax;
-                    processRentalPayment(renterId, land.getOwner(), land, null, price, tax, total);
-                }
-            }
-
-            for (SubArea area : plugin.getDataManager().getSubAreas()) {
-                UUID renterId = area.getRenter();
-                if (renterId != null) {
-                    UUID ownerId = null;
-                    for (String chunkKey : area.getChunkKeys()) {
-                        Land land = plugin.getDataManager().getLand(chunkKey);
-                        if (land != null) {
-                            ownerId = land.getOwner();
-                            break;
-                        }
+            CompletableFuture.runAsync(() -> {
+                List<Land> lands = new ArrayList<>(plugin.getDataManager().getLands());
+                List<SubArea> subAreas = new ArrayList<>(plugin.getDataManager().getSubAreas());
+                
+                for (Land land : lands) {
+                    UUID renterId = land.getRenter();
+                    if (renterId != null) {
+                        double price = land.getRentalPrice();
+                        double tax = price * plugin.getConfigManager().getTaxPercentForRent();
+                        double total = price + tax;
+                        processRentalPayment(renterId, land.getOwner(), land, null, price, tax, total);
                     }
-                    
-                    if (ownerId == null) continue;
-                    
-                    double price = area.getRentalPrice();
-                    double tax = price * plugin.getConfigManager().getTaxPercentForRent();
-                    double total = price + tax;
-                    processRentalPayment(renterId, ownerId, null, area, price, tax, total);
                 }
-            }
+                
+                for (SubArea area : subAreas) {
+                    UUID renterId = area.getRenter();
+                    if (renterId != null) {
+                        UUID ownerId = null;
+                        for (String chunkKey : area.getChunkKeys()) {
+                            Land land = plugin.getDataManager().getLand(chunkKey);
+                            if (land != null) {
+                                ownerId = land.getOwner();
+                                break;
+                            }
+                        }
+                        if (ownerId == null) continue;
+                        double price = area.getRentalPrice();
+                        double tax = price * plugin.getConfigManager().getTaxPercentForRent();
+                        double total = price + tax;
+                        processRentalPayment(renterId, ownerId, null, area, price, tax, total);
+                    }
+                }
+            }, LandCoin.getAsyncExecutor());
         }
 
         private void processRentalPayment(UUID renterId, UUID ownerId, Land land, SubArea area, 
@@ -393,7 +413,7 @@ public class LandCoin extends JavaPlugin implements Listener {
             }
 
             plugin.getCoinCardAPI().getBalance(renterCard, new BalanceCallback() {
-                int attempts = 0;
+                final AtomicInteger attempts = new AtomicInteger(0);
                 
                 @Override
                 public void onResult(double balance, String error) {
@@ -417,25 +437,29 @@ public class LandCoin extends JavaPlugin implements Listener {
                                 data.addRentedLand(land.getChunkKey(), expiry);
                             }
                             
-                            plugin.getDataManager().saveAll();
+                            plugin.getDataManager().saveAllAsync();
 
-                            Player renter = Bukkit.getPlayer(renterId);
-                            if (renter != null && renter.isOnline()) {
-                                renter.sendMessage(ChatColor.GREEN + "Your rental has been automatically renewed for another 24 hours!");
-                            }
-                            
-                            Player owner = Bukkit.getPlayer(ownerId);
-                            if (owner != null && owner.isOnline()) {
-                                owner.sendMessage(ChatColor.GREEN + "You received " + formatCoin(price) + 
-                                        " coins from rental (TX: " + txId + ")");
-                            }
+                            new BukkitRunnable() {
+                                @Override
+                                public void run() {
+                                    Player renter = Bukkit.getPlayer(renterId);
+                                    if (renter != null && renter.isOnline()) {
+                                        renter.sendMessage(ChatColor.GREEN + "Your rental has been automatically renewed for another 24 hours!");
+                                    }
+                                    Player owner = Bukkit.getPlayer(ownerId);
+                                    if (owner != null && owner.isOnline()) {
+                                        owner.sendMessage(ChatColor.GREEN + "You received " + formatCoin(price) + 
+                                                " coins from rental (TX: " + txId + ")");
+                                    }
+                                }
+                            }.runTask(plugin);
                         }
 
                         @Override
                         public void onFailure(String error) {
-                            attempts++;
-                            if (attempts >= plugin.getConfigManager().getMaxPaymentAttempts()) {
-                                removeRental(renterId, land, area, "Payment failed after " + attempts + " attempts");
+                            int currentAttempt = attempts.incrementAndGet();
+                            if (currentAttempt >= plugin.getConfigManager().getMaxPaymentAttempts()) {
+                                removeRental(renterId, land, area, "Payment failed after " + currentAttempt + " attempts");
                             } else {
                                 plugin.getTransactionQueue().enqueue(renterCard, ownerCard, price, this);
                             }
@@ -447,19 +471,18 @@ public class LandCoin extends JavaPlugin implements Listener {
 
         private void removeRental(UUID renterId, Land land, SubArea area, String reason) {
             String type = "";
-            String identifier = "";
-            String displayName = "";
+            final String displayName;
             
             if (area != null) {
                 area.removeMember(renterId);
                 type = "sub-area";
-                identifier = area.getId();
-                displayName = "Sub-area " + area.getId().substring(0, 8) + "...";
+                displayName = "Sub-area " + area.getId().substring(0, Math.min(8, area.getId().length())) + "...";
             } else if (land != null) {
                 land.removeMember(renterId);
                 type = "land";
-                identifier = land.getChunkKey();
                 displayName = "Land at " + land.getWorld() + " " + land.getX() + "," + land.getZ();
+            } else {
+                displayName = "";
             }
             
             PlayerData data = plugin.getDataManager().getPlayer(renterId);
@@ -471,7 +494,7 @@ public class LandCoin extends JavaPlugin implements Listener {
                 data.addRentalLostItem(land.getChunkKey());
             }
             
-            plugin.getDataManager().saveAll();
+            plugin.getDataManager().saveAllAsync();
             
             String message = ChatColor.RED + "Your " + type + " rental has been cancelled: " + reason;
             
@@ -479,33 +502,39 @@ public class LandCoin extends JavaPlugin implements Listener {
                     renterId, message, PendingNotification.NotificationType.RENTAL_LOST);
             pendingNotifications.add(notification);
             
-            Player renter = Bukkit.getPlayer(renterId);
-            if (renter != null && renter.isOnline()) {
-                renter.sendMessage(message);
-                renter.sendMessage(ChatColor.YELLOW + "The " + displayName + " is now available for others to rent.");
-                pendingNotifications.removeIf(n -> n.getPlayerId().equals(renterId) && n.getMessage().equals(message));
-            }
-            
-            if (land != null) {
-                Player owner = Bukkit.getPlayer(land.getOwner());
-                if (owner != null && owner.isOnline()) {
-                    owner.sendMessage(ChatColor.YELLOW + "Your land at " + land.getWorld() + " " + land.getX() + "," + land.getZ() + 
-                            " is now available for rent again.");
-                }
-            } else if (area != null) {
-                for (String chunkKey : area.getChunkKeys()) {
-                    Land l = plugin.getDataManager().getLand(chunkKey);
-                    if (l != null) {
-                        Player owner = Bukkit.getPlayer(l.getOwner());
+            final String finalDisplayName = displayName;
+            new BukkitRunnable() {
+                @Override
+                public void run() {
+                    Player renter = Bukkit.getPlayer(renterId);
+                    if (renter != null && renter.isOnline()) {
+                        renter.sendMessage(message);
+                        renter.sendMessage(ChatColor.YELLOW + "The " + finalDisplayName + " is now available for others to rent.");
+                        pendingNotifications.removeIf(n -> n.getPlayerId().equals(renterId) && n.getMessage().equals(message));
+                    }
+                    
+                    if (land != null) {
+                        Player owner = Bukkit.getPlayer(land.getOwner());
                         if (owner != null && owner.isOnline()) {
-                            owner.sendMessage(ChatColor.YELLOW + "Your sub-area is now available for rent again.");
+                            owner.sendMessage(ChatColor.YELLOW + "Your land at " + land.getWorld() + " " + land.getX() + "," + land.getZ() + 
+                                    " is now available for rent again.");
                         }
-                        break;
+                    } else if (area != null) {
+                        for (String chunkKey : area.getChunkKeys()) {
+                            Land l = plugin.getDataManager().getLand(chunkKey);
+                            if (l != null) {
+                                Player owner = Bukkit.getPlayer(l.getOwner());
+                                if (owner != null && owner.isOnline()) {
+                                    owner.sendMessage(ChatColor.YELLOW + "Your sub-area is now available for rent again.");
+                                }
+                                break;
+                            }
+                        }
                     }
                 }
-            }
+            }.runTask(plugin);
             
-            plugin.getLogger().info("Rental removed for " + renterId + ": " + displayName + " - " + reason);
+            plugin.getLogger().info("Rental removed for " + renterId + ": " + finalDisplayName + " - " + reason);
         }
 
         public List<PendingNotification> getPendingNotifications(UUID playerId) {
@@ -524,13 +553,14 @@ public class LandCoin extends JavaPlugin implements Listener {
         private File configFile;
         private YamlConfiguration config;
 
-        private String serverCard;
-        private double landBuyPrice;
-        private double landSellPrice;
-        private double landDailyTax;
-        private double taxPercentForRent;
-        private double taxForSell;
-        private int maxPaymentAttempts;
+        private volatile String serverCard;
+        private volatile double landBuyPrice;
+        private volatile double landSellPrice;
+        private volatile boolean dailyTax;
+        private volatile double landDailyTax;
+        private volatile double taxPercentForRent;
+        private volatile double taxForSell;
+        private volatile int maxPaymentAttempts;
 
         public ConfigManager(LandCoin plugin) {
             this.plugin = plugin;
@@ -547,6 +577,19 @@ public class LandCoin extends JavaPlugin implements Listener {
             serverCard = config.getString("ServerCard", "");
             landBuyPrice = config.getDouble("LandBuyPrice", 0.00000001);
             landSellPrice = config.getDouble("LandSellPrice", 0.00000001);
+            
+            // Check if dailyTax exists, if not, add it with default true
+            if (!config.contains("DailyTax")) {
+                config.set("DailyTax", true);
+                try {
+                    config.save(configFile);
+                    plugin.getLogger().info("Added DailyTax: true to config.yml");
+                } catch (IOException e) {
+                    plugin.getLogger().warning("Failed to save DailyTax to config: " + e.getMessage());
+                }
+            }
+            dailyTax = config.getBoolean("DailyTax", true);
+            
             landDailyTax = config.getDouble("LandDailyTax", 0.00000001);
             taxPercentForRent = config.getDouble("TaxPercentForRent", 0.01);
             taxForSell = config.getDouble("TaxForSell", 0.01);
@@ -556,6 +599,7 @@ public class LandCoin extends JavaPlugin implements Listener {
         public String getServerCard() { return serverCard; }
         public double getLandBuyPrice() { return landBuyPrice; }
         public double getLandSellPrice() { return landSellPrice; }
+        public boolean isDailyTax() { return dailyTax; }
         public double getLandDailyTax() { return landDailyTax; }
         public double getTaxPercentForRent() { return taxPercentForRent; }
         public double getTaxForSell() { return taxForSell; }
@@ -568,6 +612,8 @@ public class LandCoin extends JavaPlugin implements Listener {
         private final Map<String, SubArea> subAreas = new ConcurrentHashMap<>();
         private final Map<UUID, PlayerData> players = new ConcurrentHashMap<>();
         private File dataFile;
+        private final AtomicBoolean isLoading = new AtomicBoolean(false);
+        private final AtomicBoolean isSaving = new AtomicBoolean(false);
 
         public DataManager(LandCoin plugin) {
             this.plugin = plugin;
@@ -575,7 +621,11 @@ public class LandCoin extends JavaPlugin implements Listener {
         }
 
         public void loadAll() {
-            if (!dataFile.exists()) return;
+            if (isLoading.getAndSet(true)) return;
+            if (!dataFile.exists()) {
+                isLoading.set(false);
+                return;
+            }
 
             try (ObjectInputStream ois = new ObjectInputStream(new FileInputStream(dataFile))) {
                 int landCount = ois.readInt();
@@ -606,10 +656,17 @@ public class LandCoin extends JavaPlugin implements Listener {
                 plugin.getLogger().info("Loaded " + lands.size() + " lands, " + subAreas.size() + " sub-areas, " + players.size() + " players");
             } catch (Exception e) {
                 plugin.getLogger().warning("Failed to load data: " + e.getMessage());
+            } finally {
+                isLoading.set(false);
             }
         }
 
-        public void saveAll() {
+        public CompletableFuture<Void> loadAllAsync() {
+            return CompletableFuture.runAsync(this::loadAll, LandCoin.getAsyncExecutor());
+        }
+
+        public void saveAllSync() {
+            if (isSaving.getAndSet(true)) return;
             try (ObjectOutputStream oos = new ObjectOutputStream(new FileOutputStream(dataFile))) {
                 oos.writeInt(lands.size());
                 for (Land land : lands.values()) {
@@ -627,7 +684,13 @@ public class LandCoin extends JavaPlugin implements Listener {
                 }
             } catch (Exception e) {
                 plugin.getLogger().severe("Failed to save data: " + e.getMessage());
+            } finally {
+                isSaving.set(false);
             }
+        }
+
+        public CompletableFuture<Void> saveAllAsync() {
+            return CompletableFuture.runAsync(this::saveAllSync, LandCoin.SAVE_EXECUTOR);
         }
 
         public Land getLand(String chunkKey) { return lands.get(chunkKey); }
@@ -655,14 +718,14 @@ public class LandCoin extends JavaPlugin implements Listener {
     public static class PlayerData implements Serializable {
         private static final long serialVersionUID = 1L;
         private final UUID uuid;
-        private String lastKnownName;
-        private final Map<String, Long> rentedLands = new HashMap<>();
-        private final Map<String, Long> rentedSubAreas = new HashMap<>();
-        private final Map<String, Set<UUID>> trustedPlayers = new HashMap<>();
-        private final Map<String, Set<UUID>> trustedSubAreas = new HashMap<>();
-        private long lastTaxPayment;
-        private final List<String> taxLostLands = new ArrayList<>();
-        private final List<String> rentalLostItems = new ArrayList<>();
+        private volatile String lastKnownName;
+        private final Map<String, Long> rentedLands = new ConcurrentHashMap<>();
+        private final Map<String, Long> rentedSubAreas = new ConcurrentHashMap<>();
+        private final Map<String, Set<UUID>> trustedPlayers = new ConcurrentHashMap<>();
+        private final Map<String, Set<UUID>> trustedSubAreas = new ConcurrentHashMap<>();
+        private volatile long lastTaxPayment;
+        private final List<String> taxLostLands = new CopyOnWriteArrayList<>();
+        private final List<String> rentalLostItems = new CopyOnWriteArrayList<>();
 
         public PlayerData(UUID uuid) {
             this.uuid = uuid;
@@ -682,8 +745,13 @@ public class LandCoin extends JavaPlugin implements Listener {
         public List<String> getRentalLostItems() { return rentalLostItems; }
 
         public void updateName() {
-            Player player = Bukkit.getPlayer(uuid);
-            if (player != null) this.lastKnownName = player.getName();
+            new BukkitRunnable() {
+                @Override
+                public void run() {
+                    Player player = Bukkit.getPlayer(uuid);
+                    if (player != null) lastKnownName = player.getName();
+                }
+            }.runTask(JavaPlugin.getProvidingPlugin(LandCoin.class));
         }
 
         public void addRentedLand(String chunkKey, long expiry) {
@@ -886,40 +954,40 @@ public class LandCoin extends JavaPlugin implements Listener {
     public static class Permissions implements Serializable {
         private static final long serialVersionUID = 1L;
         
-        private boolean ownerBlockBreak = true;
-        private boolean ownerBlockPlace = true;
-        private boolean ownerAccess = true;
-        private boolean ownerUse = true;
+        private volatile boolean ownerBlockBreak = true;
+        private volatile boolean ownerBlockPlace = true;
+        private volatile boolean ownerAccess = true;
+        private volatile boolean ownerUse = true;
         
-        private boolean assistBlockBreak = true;
-        private boolean assistBlockPlace = true;
-        private boolean assistAccess = true;
-        private boolean assistUse = true;
+        private volatile boolean assistBlockBreak = true;
+        private volatile boolean assistBlockPlace = true;
+        private volatile boolean assistAccess = true;
+        private volatile boolean assistUse = true;
         
-        private boolean trustBlockBreak = true;
-        private boolean trustBlockPlace = true;
-        private boolean trustAccess = true;
-        private boolean trustUse = true;
+        private volatile boolean trustBlockBreak = true;
+        private volatile boolean trustBlockPlace = true;
+        private volatile boolean trustAccess = true;
+        private volatile boolean trustUse = true;
         
-        private boolean memberBlockBreak = false;
-        private boolean memberBlockPlace = false;
-        private boolean memberAccess = false;
-        private boolean memberUse = false;
+        private volatile boolean memberBlockBreak = false;
+        private volatile boolean memberBlockPlace = false;
+        private volatile boolean memberAccess = false;
+        private volatile boolean memberUse = false;
         
-        private boolean rentBlockBreak = false;
-        private boolean rentBlockPlace = false;
-        private boolean rentAccess = true;
-        private boolean rentUse = true;
+        private volatile boolean rentBlockBreak = false;
+        private volatile boolean rentBlockPlace = false;
+        private volatile boolean rentAccess = true;
+        private volatile boolean rentUse = true;
         
-        private boolean buyerBlockBreak = true;
-        private boolean buyerBlockPlace = true;
-        private boolean buyerAccess = true;
-        private boolean buyerUse = true;
+        private volatile boolean buyerBlockBreak = true;
+        private volatile boolean buyerBlockPlace = true;
+        private volatile boolean buyerAccess = true;
+        private volatile boolean buyerUse = true;
         
-        private boolean untrustedBlockBreak = false;
-        private boolean untrustedBlockPlace = false;
-        private boolean untrustedAccess = false;
-        private boolean untrustedUse = false;
+        private volatile boolean untrustedBlockBreak = false;
+        private volatile boolean untrustedBlockPlace = false;
+        private volatile boolean untrustedAccess = false;
+        private volatile boolean untrustedUse = false;
 
         public boolean canBreak(Role role) {
             switch (role) {
@@ -973,7 +1041,7 @@ public class LandCoin extends JavaPlugin implements Listener {
             }
         }
 
-        public void setPermission(Role role, PermissionType type, boolean value) {
+        public synchronized void setPermission(Role role, PermissionType type, boolean value) {
             switch (role) {
                 case OWNER:
                     switch (type) {
@@ -1111,10 +1179,10 @@ public class LandCoin extends JavaPlugin implements Listener {
         private transient LandCoin plugin;
         private final String world;
         private final int x, z;
-        private UUID owner;
-        private double forSalePrice;
-        private double rentalPrice;
-        private final Map<String, SubArea> subAreas = new HashMap<>();
+        private volatile UUID owner;
+        private volatile double forSalePrice;
+        private volatile double rentalPrice;
+        private final Map<String, SubArea> subAreas = new ConcurrentHashMap<>();
         private final Permissions permissions;
         private final Map<UUID, Role> memberRoles = new ConcurrentHashMap<>();
 
@@ -1285,8 +1353,8 @@ public class LandCoin extends JavaPlugin implements Listener {
         private final String id;
         private final String world;
         private final int minX, minY, minZ, maxX, maxY, maxZ;
-        private final Set<String> chunkKeys = new HashSet<>();
-        private double rentalPrice;
+        private final Set<String> chunkKeys = new CopyOnWriteArraySet<>();
+        private volatile double rentalPrice;
         private final Permissions permissions;
         private final Map<UUID, Role> memberRoles = new ConcurrentHashMap<>();
         private final Map<UUID, Long> lastEntryTimes = new ConcurrentHashMap<>();
@@ -1474,72 +1542,52 @@ public class LandCoin extends JavaPlugin implements Listener {
 
         public boolean canBuild(Player player, Location loc) {
             if (player.hasPermission("landcoin.admin.bypass")) return true;
-
             Land land = getLandAt(loc);
             if (land == null) return true;
-
             SubArea area = land.getSubAreaAt(loc);
             if (area != null) {
                 Role role = area.getRole(player.getUniqueId());
-                if (role != Role.NONE) {
-                    return area.getPermissions().canBreak(role);
-                }
+                if (role != Role.NONE) return area.getPermissions().canBreak(role);
             }
-
             Role role = land.getRole(player.getUniqueId());
             return land.getPermissions().canBreak(role);
         }
 
         public boolean canPlace(Player player, Location loc) {
             if (player.hasPermission("landcoin.admin.bypass")) return true;
-
             Land land = getLandAt(loc);
             if (land == null) return true;
-
             SubArea area = land.getSubAreaAt(loc);
             if (area != null) {
                 Role role = area.getRole(player.getUniqueId());
-                if (role != Role.NONE) {
-                    return area.getPermissions().canPlace(role);
-                }
+                if (role != Role.NONE) return area.getPermissions().canPlace(role);
             }
-
             Role role = land.getRole(player.getUniqueId());
             return land.getPermissions().canPlace(role);
         }
 
         public boolean canAccess(Player player, Location loc) {
             if (player.hasPermission("landcoin.admin.bypass")) return true;
-
             Land land = getLandAt(loc);
             if (land == null) return true;
-
             SubArea area = land.getSubAreaAt(loc);
             if (area != null) {
                 Role role = area.getRole(player.getUniqueId());
-                if (role != Role.NONE) {
-                    return area.getPermissions().canAccess(role);
-                }
+                if (role != Role.NONE) return area.getPermissions().canAccess(role);
             }
-
             Role role = land.getRole(player.getUniqueId());
             return land.getPermissions().canAccess(role);
         }
 
         public boolean canUse(Player player, Location loc) {
             if (player.hasPermission("landcoin.admin.bypass")) return true;
-
             Land land = getLandAt(loc);
             if (land == null) return true;
-
             SubArea area = land.getSubAreaAt(loc);
             if (area != null) {
                 Role role = area.getRole(player.getUniqueId());
-                if (role != Role.NONE) {
-                    return area.getPermissions().canUse(role);
-                }
+                if (role != Role.NONE) return area.getPermissions().canUse(role);
             }
-
             Role role = land.getRole(player.getUniqueId());
             return land.getPermissions().canUse(role);
         }
@@ -1548,26 +1596,28 @@ public class LandCoin extends JavaPlugin implements Listener {
             return canPlace(player, loc) || canBuild(player, loc);
         }
 
-        public boolean claimLand(Player player, SelectionManager.Selection sel) {
-            if (!sel.isValid()) return false;
+        public void claimLand(Player player, SelectionManager.Selection sel) {
+            if (!sel.isValid()) {
+                player.sendMessage(ChatColor.RED + "Make a selection first with /selection!");
+                return;
+            }
 
             List<String> chunksToClaim = new ArrayList<>();
             for (String chunkKey : sel.getChunks()) {
-                Land existing = plugin.getDataManager().getLand(chunkKey);
-                if (existing == null) {
+                if (plugin.getDataManager().getLand(chunkKey) == null) {
                     chunksToClaim.add(chunkKey);
                 }
             }
 
             if (chunksToClaim.isEmpty()) {
                 player.sendMessage(ChatColor.RED + "All chunks in selection are already claimed!");
-                return false;
+                return;
             }
 
             String serverCard = plugin.getConfigManager().getServerCard();
             if (serverCard == null || serverCard.isEmpty()) {
                 player.sendMessage(ChatColor.RED + "Server card not configured!");
-                return false;
+                return;
             }
 
             double totalCost = chunksToClaim.size() * plugin.getConfigManager().getLandBuyPrice();
@@ -1575,7 +1625,7 @@ public class LandCoin extends JavaPlugin implements Listener {
 
             if (playerCard == null) {
                 player.sendMessage(ChatColor.RED + "You don't have a card set!");
-                return false;
+                return;
             }
 
             plugin.getCoinCardAPI().getBalance(playerCard, new BalanceCallback() {
@@ -1585,31 +1635,34 @@ public class LandCoin extends JavaPlugin implements Listener {
                         player.sendMessage(ChatColor.RED + "Error checking balance: " + error);
                         return;
                     }
-
                     if (balance < totalCost) {
-                        player.sendMessage(ChatColor.RED + "Insufficient balance! Need " +
-                                formatCoin(totalCost) + " but have " + formatCoin(balance));
+                        player.sendMessage(ChatColor.RED + "Insufficient balance! Need " + formatCoin(totalCost));
                         return;
                     }
 
                     plugin.getTransactionQueue().enqueue(playerCard, serverCard, totalCost, new TransferCallback() {
                         @Override
                         public void onSuccess(String txId, double amount) {
-                            for (String chunkKey : chunksToClaim) {
-                                String[] parts = chunkKey.split(",");
-                                World w = Bukkit.getWorld(parts[0]);
-                                if (w == null) {
-                                    plugin.getLogger().warning("World not loaded: " + parts[0]);
-                                    continue;
+                            CompletableFuture.runAsync(() -> {
+                                for (String chunkKey : chunksToClaim) {
+                                    String[] parts = chunkKey.split(",");
+                                    World w = Bukkit.getWorld(parts[0]);
+                                    if (w == null) continue;
+                                    int x = Integer.parseInt(parts[1]);
+                                    int z = Integer.parseInt(parts[2]);
+                                    Land land = new Land(plugin, w, x, z, player.getUniqueId());
+                                    plugin.getDataManager().addLand(land);
                                 }
-                                int x = Integer.parseInt(parts[1]);
-                                int z = Integer.parseInt(parts[2]);
-                                Land land = new Land(plugin, w, x, z, player.getUniqueId());
-                                plugin.getDataManager().addLand(land);
-                            }
-                            plugin.getDataManager().saveAll();
-                            player.sendMessage(ChatColor.GREEN + "Claimed " + chunksToClaim.size() +
-                                    " chunks for " + formatCoin(totalCost) + " coins (TX: " + txId + ")");
+                                plugin.getDataManager().saveAllAsync();
+                            }, LandCoin.getAsyncExecutor()).thenRun(() -> {
+                                new BukkitRunnable() {
+                                    @Override
+                                    public void run() {
+                                        player.sendMessage(ChatColor.GREEN + "Claimed " + chunksToClaim.size() +
+                                                " chunks for " + formatCoin(totalCost) + " coins (TX: " + txId + ")");
+                                    }
+                                }.runTask(plugin);
+                            });
                         }
 
                         @Override
@@ -1619,17 +1672,18 @@ public class LandCoin extends JavaPlugin implements Listener {
                     });
                 }
             });
-
-            return true;
         }
 
-        public boolean unclaimLand(Player player, SelectionManager.Selection sel) {
-            if (!sel.isValid()) return false;
+        public void unclaimLand(Player player, SelectionManager.Selection sel) {
+            if (!sel.isValid()) {
+                player.sendMessage(ChatColor.RED + "Make a selection first with /selection!");
+                return;
+            }
 
             String serverCard = plugin.getConfigManager().getServerCard();
             if (serverCard == null || serverCard.isEmpty()) {
                 player.sendMessage(ChatColor.RED + "Server card not configured!");
-                return false;
+                return;
             }
 
             double totalRefund = 0;
@@ -1645,13 +1699,13 @@ public class LandCoin extends JavaPlugin implements Listener {
 
             if (toRemove.isEmpty()) {
                 player.sendMessage(ChatColor.RED + "No lands you own in selection!");
-                return false;
+                return;
             }
 
             String playerCard = plugin.getCoinCardAPI().getPlayerCard(player.getUniqueId());
             if (playerCard == null) {
                 player.sendMessage(ChatColor.RED + "You don't have a card set!");
-                return false;
+                return;
             }
 
             final double finalTotalRefund = totalRefund;
@@ -1660,12 +1714,20 @@ public class LandCoin extends JavaPlugin implements Listener {
             plugin.getTransactionQueue().enqueue(serverCard, playerCard, totalRefund, new TransferCallback() {
                 @Override
                 public void onSuccess(String txId, double amount) {
-                    for (String chunkKey : finalToRemove) {
-                        plugin.getDataManager().removeLand(chunkKey);
-                    }
-                    plugin.getDataManager().saveAll();
-                    player.sendMessage(ChatColor.GREEN + "Unclaimed " + finalToRemove.size() +
-                            " chunks, refunded " + formatCoin(finalTotalRefund) + " coins (TX: " + txId + ")");
+                    CompletableFuture.runAsync(() -> {
+                        for (String chunkKey : finalToRemove) {
+                            plugin.getDataManager().removeLand(chunkKey);
+                        }
+                        plugin.getDataManager().saveAllAsync();
+                    }, LandCoin.getAsyncExecutor()).thenRun(() -> {
+                        new BukkitRunnable() {
+                            @Override
+                            public void run() {
+                                player.sendMessage(ChatColor.GREEN + "Unclaimed " + finalToRemove.size() +
+                                        " chunks, refunded " + formatCoin(finalTotalRefund) + " coins (TX: " + txId + ")");
+                            }
+                        }.runTask(plugin);
+                    });
                 }
 
                 @Override
@@ -1673,17 +1735,18 @@ public class LandCoin extends JavaPlugin implements Listener {
                     player.sendMessage(ChatColor.RED + "Refund failed: " + error);
                 }
             });
-
-            return true;
         }
 
-        public boolean buyLand(Player player, SelectionManager.Selection sel) {
-            if (!sel.isValid()) return false;
+        public void buyLand(Player player, SelectionManager.Selection sel) {
+            if (!sel.isValid()) {
+                player.sendMessage(ChatColor.RED + "Make a selection first with /selection!");
+                return;
+            }
 
             String serverCard = plugin.getConfigManager().getServerCard();
             if (serverCard == null || serverCard.isEmpty()) {
                 player.sendMessage(ChatColor.RED + "Server card not configured!");
-                return false;
+                return;
             }
 
             BigDecimal totalPrice = BigDecimal.ZERO;
@@ -1699,13 +1762,13 @@ public class LandCoin extends JavaPlugin implements Listener {
 
             if (toBuy.isEmpty()) {
                 player.sendMessage(ChatColor.RED + "No lands for sale in selection!");
-                return false;
+                return;
             }
 
             String playerCard = plugin.getCoinCardAPI().getPlayerCard(player.getUniqueId());
             if (playerCard == null) {
                 player.sendMessage(ChatColor.RED + "You don't have a card set!");
-                return false;
+                return;
             }
 
             final BigDecimal finalTotalPrice = totalPrice;
@@ -1718,7 +1781,6 @@ public class LandCoin extends JavaPlugin implements Listener {
                         player.sendMessage(ChatColor.RED + "Error checking balance: " + error);
                         return;
                     }
-
                     if (BigDecimal.valueOf(balance).compareTo(finalTotalPrice) < 0) {
                         player.sendMessage(ChatColor.RED + "Insufficient balance! Need " + formatCoin(finalTotalPrice));
                         return;
@@ -1726,10 +1788,8 @@ public class LandCoin extends JavaPlugin implements Listener {
 
                     for (Map.Entry<String, Land> entry : finalToBuy.entrySet()) {
                         Land land = entry.getValue();
-                        
                         double originalPrice = land.getForSalePrice();
                         land.setForSale(-1);
-                        plugin.getDataManager().saveAll();
 
                         String sellerCard = plugin.getCoinCardAPI().getPlayerCard(land.getOwner());
                         BigDecimal tax = BigDecimal.valueOf(originalPrice).multiply(
@@ -1740,27 +1800,27 @@ public class LandCoin extends JavaPlugin implements Listener {
                             @Override
                             public void onSuccess(String txId, double amount) {
                                 plugin.getTransactionQueue().enqueue(playerCard, serverCard, tax.doubleValue(), null);
-
                                 land.setOwner(player.getUniqueId());
                                 land.clearForSale();
-                                plugin.getDataManager().saveAll();
-
-                                player.sendMessage(ChatColor.GREEN + "Bought land for " +
-                                        formatCoin(originalPrice) + " coins (TX: " + txId + ")");
+                                plugin.getDataManager().saveAllAsync();
+                                new BukkitRunnable() {
+                                    @Override
+                                    public void run() {
+                                        player.sendMessage(ChatColor.GREEN + "Bought land for " + formatCoin(originalPrice) + " coins (TX: " + txId + ")");
+                                    }
+                                }.runTask(plugin);
                             }
 
                             @Override
                             public void onFailure(String error) {
                                 land.setForSale(originalPrice);
-                                plugin.getDataManager().saveAll();
+                                plugin.getDataManager().saveAllAsync();
                                 player.sendMessage(ChatColor.RED + "Purchase failed: " + error);
                             }
                         });
                     }
                 }
             });
-
-            return true;
         }
 
         public void setLandForSale(Player player, Land land, double price) {
@@ -1768,14 +1828,12 @@ public class LandCoin extends JavaPlugin implements Listener {
                 player.sendMessage(ChatColor.RED + "Price must be positive!");
                 return;
             }
-            
             if (!land.getOwner().equals(player.getUniqueId()) && !player.hasPermission("landcoin.admin")) {
                 player.sendMessage(ChatColor.RED + "You don't own this land!");
                 return;
             }
-
             land.setForSale(price);
-            plugin.getDataManager().saveAll();
+            plugin.getDataManager().saveAllAsync();
             player.sendMessage(ChatColor.GREEN + "Land set for sale at " + formatCoin(price) + " coins");
         }
 
@@ -1784,32 +1842,29 @@ public class LandCoin extends JavaPlugin implements Listener {
                 player.sendMessage(ChatColor.RED + "Price must be positive!");
                 return;
             }
-            
             if (!land.getOwner().equals(player.getUniqueId()) && !player.hasPermission("landcoin.admin")) {
                 player.sendMessage(ChatColor.RED + "You don't own this land!");
                 return;
             }
-
             land.setForRent(price);
-            plugin.getDataManager().saveAll();
+            plugin.getDataManager().saveAllAsync();
             player.sendMessage(ChatColor.GREEN + "Land set for rent at " + formatCoin(price) + " coins/day");
         }
 
-        public boolean rentLand(Player player, Land land) {
+        public void rentLand(Player player, Land land) {
             if (!land.isForRent()) {
                 player.sendMessage(ChatColor.RED + "This land is not for rent!");
-                return false;
+                return;
             }
-
             if (land.hasRenter()) {
                 player.sendMessage(ChatColor.RED + "This land is already rented!");
-                return false;
+                return;
             }
 
             String serverCard = plugin.getConfigManager().getServerCard();
             if (serverCard == null || serverCard.isEmpty()) {
                 player.sendMessage(ChatColor.RED + "Server card not configured!");
-                return false;
+                return;
             }
 
             double price = land.getRentalPrice();
@@ -1819,7 +1874,7 @@ public class LandCoin extends JavaPlugin implements Listener {
             String playerCard = plugin.getCoinCardAPI().getPlayerCard(player.getUniqueId());
             if (playerCard == null) {
                 player.sendMessage(ChatColor.RED + "You don't have a card set!");
-                return false;
+                return;
             }
 
             plugin.getCoinCardAPI().getBalance(playerCard, new BalanceCallback() {
@@ -1829,7 +1884,6 @@ public class LandCoin extends JavaPlugin implements Listener {
                         player.sendMessage(ChatColor.RED + "Error checking balance: " + error);
                         return;
                     }
-
                     if (balance < total) {
                         player.sendMessage(ChatColor.RED + "Insufficient balance! Need " + formatCoin(total));
                         return;
@@ -1842,15 +1896,11 @@ public class LandCoin extends JavaPlugin implements Listener {
                         @Override
                         public void onSuccess(String txId, double amount) {
                             plugin.getTransactionQueue().enqueue(playerCard, serverCard, tax, null);
-
                             long expiry = System.currentTimeMillis() + 86400000L;
                             land.setRole(player.getUniqueId(), Role.RENT);
-                            
                             PlayerData data = plugin.getDataManager().getPlayer(player.getUniqueId());
                             data.addRentedLand(land.getChunkKey(), expiry);
-                            
-                            plugin.getDataManager().saveAll();
-
+                            plugin.getDataManager().saveAllAsync();
                             player.sendMessage(ChatColor.GREEN + "You rented this land for 24 hours for " +
                                     formatCoin(total) + " coins (TX: " + txId + ")");
                             player.sendMessage(ChatColor.YELLOW + "This rental will be automatically renewed every 24 hours if you have sufficient funds.");
@@ -1863,63 +1913,14 @@ public class LandCoin extends JavaPlugin implements Listener {
                     });
                 }
             });
-
-            return true;
         }
 
         public void unrentLand(Player player, Land land) {
             land.removeMember(player.getUniqueId());
-            
             PlayerData data = plugin.getDataManager().getPlayer(player.getUniqueId());
             data.removeRentedLand(land.getChunkKey());
-            
-            plugin.getDataManager().saveAll();
+            plugin.getDataManager().saveAllAsync();
             player.sendMessage(ChatColor.GREEN + "You are no longer renting this land");
-        }
-
-        public void trustLand(Player player, Land land, UUID targetUUID, Role role) {
-            if (!land.getOwner().equals(player.getUniqueId()) && !player.hasPermission("landcoin.admin")) {
-                player.sendMessage(ChatColor.RED + "You don't own this land!");
-                return;
-            }
-            
-            if (role == Role.OWNER || role == Role.NONE) {
-                player.sendMessage(ChatColor.RED + "Invalid role! Choose ASSIST, TRUST, MEMBER, or UNTRUSTED.");
-                return;
-            }
-
-            land.setRole(targetUUID, role);
-            plugin.getDataManager().saveAll();
-            
-            String targetName = Bukkit.getOfflinePlayer(targetUUID).getName();
-            player.sendMessage(ChatColor.GREEN + targetName + " now has role " + role + " in this land");
-            
-            Player target = Bukkit.getPlayer(targetUUID);
-            if (target != null && target.isOnline()) {
-                if (role == Role.UNTRUSTED) {
-                    target.sendMessage(ChatColor.RED + "You are now untrusted in " + player.getName() + "'s land");
-                } else {
-                    target.sendMessage(ChatColor.GREEN + "You now have role " + role + " in " + player.getName() + "'s land");
-                }
-            }
-        }
-
-        public void untrustLand(Player player, Land land, UUID targetUUID) {
-            if (!land.getOwner().equals(player.getUniqueId()) && !player.hasPermission("landcoin.admin")) {
-                player.sendMessage(ChatColor.RED + "You don't own this land!");
-                return;
-            }
-
-            land.removeMember(targetUUID);
-            plugin.getDataManager().saveAll();
-            
-            String targetName = Bukkit.getOfflinePlayer(targetUUID).getName();
-            player.sendMessage(ChatColor.GREEN + targetName + " no longer has trust in this land");
-            
-            Player target = Bukkit.getPlayer(targetUUID);
-            if (target != null && target.isOnline()) {
-                target.sendMessage(ChatColor.RED + "You lost trust in " + player.getName() + "'s land");
-            }
         }
 
         public void trustLandsInSelection(Player player, SelectionManager.Selection sel, UUID targetUUID, Role role) {
@@ -1938,10 +1939,9 @@ public class LandCoin extends JavaPlugin implements Listener {
             }
 
             if (count > 0) {
-                plugin.getDataManager().saveAll();
+                plugin.getDataManager().saveAllAsync();
                 String targetName = Bukkit.getOfflinePlayer(targetUUID).getName();
                 player.sendMessage(ChatColor.GREEN + "Gave role " + role + " to " + targetName + " in " + count + " lands");
-                
                 Player target = Bukkit.getPlayer(targetUUID);
                 if (target != null && target.isOnline()) {
                     if (role == Role.UNTRUSTED) {
@@ -1971,10 +1971,9 @@ public class LandCoin extends JavaPlugin implements Listener {
             }
 
             if (count > 0) {
-                plugin.getDataManager().saveAll();
+                plugin.getDataManager().saveAllAsync();
                 String targetName = Bukkit.getOfflinePlayer(targetUUID).getName();
                 player.sendMessage(ChatColor.GREEN + "Removed trust from " + targetName + " in " + count + " lands");
-                
                 Player target = Bukkit.getPlayer(targetUUID);
                 if (target != null && target.isOnline()) {
                     target.sendMessage(ChatColor.RED + "You lost trust in " + count + " lands owned by " + player.getName());
@@ -2000,7 +1999,7 @@ public class LandCoin extends JavaPlugin implements Listener {
             }
 
             if (count > 0) {
-                plugin.getDataManager().saveAll();
+                plugin.getDataManager().saveAllAsync();
                 player.sendMessage(ChatColor.GREEN + "Set permission " + perm + " to " + value + " for role " + role + " in " + count + " lands");
             } else {
                 player.sendMessage(ChatColor.YELLOW + "No eligible lands found in selection");
@@ -2012,7 +2011,6 @@ public class LandCoin extends JavaPlugin implements Listener {
                 player.sendMessage(ChatColor.RED + "Make a selection first with /selection!");
                 return;
             }
-
             if (price <= 0) {
                 player.sendMessage(ChatColor.RED + "Price must be positive!");
                 return;
@@ -2028,36 +2026,8 @@ public class LandCoin extends JavaPlugin implements Listener {
             }
 
             if (count > 0) {
-                plugin.getDataManager().saveAll();
+                plugin.getDataManager().saveAllAsync();
                 player.sendMessage(ChatColor.GREEN + "Set " + count + " lands for rent at " + formatCoin(price) + " coins/day");
-            } else {
-                player.sendMessage(ChatColor.YELLOW + "No lands you own found in selection");
-            }
-        }
-
-        public void setLandForSaleInSelection(Player player, SelectionManager.Selection sel, double price) {
-            if (!sel.isValid()) {
-                player.sendMessage(ChatColor.RED + "Make a selection first with /selection!");
-                return;
-            }
-
-            if (price <= 0) {
-                player.sendMessage(ChatColor.RED + "Price must be positive!");
-                return;
-            }
-
-            int count = 0;
-            for (String chunkKey : sel.getChunks()) {
-                Land land = plugin.getDataManager().getLand(chunkKey);
-                if (land != null && (land.getOwner().equals(player.getUniqueId()) || player.hasPermission("landcoin.admin"))) {
-                    land.setForSale(price);
-                    count++;
-                }
-            }
-
-            if (count > 0) {
-                plugin.getDataManager().saveAll();
-                player.sendMessage(ChatColor.GREEN + "Set " + count + " lands for sale at " + formatCoin(price) + " coins");
             } else {
                 player.sendMessage(ChatColor.YELLOW + "No lands you own found in selection");
             }
@@ -2079,8 +2049,35 @@ public class LandCoin extends JavaPlugin implements Listener {
             }
 
             if (count > 0) {
-                plugin.getDataManager().saveAll();
+                plugin.getDataManager().saveAllAsync();
                 player.sendMessage(ChatColor.GREEN + "Removed rent from " + count + " lands");
+            } else {
+                player.sendMessage(ChatColor.YELLOW + "No lands you own found in selection");
+            }
+        }
+
+        public void setLandForSaleInSelection(Player player, SelectionManager.Selection sel, double price) {
+            if (!sel.isValid()) {
+                player.sendMessage(ChatColor.RED + "Make a selection first with /selection!");
+                return;
+            }
+            if (price <= 0) {
+                player.sendMessage(ChatColor.RED + "Price must be positive!");
+                return;
+            }
+
+            int count = 0;
+            for (String chunkKey : sel.getChunks()) {
+                Land land = plugin.getDataManager().getLand(chunkKey);
+                if (land != null && (land.getOwner().equals(player.getUniqueId()) || player.hasPermission("landcoin.admin"))) {
+                    land.setForSale(price);
+                    count++;
+                }
+            }
+
+            if (count > 0) {
+                plugin.getDataManager().saveAllAsync();
+                player.sendMessage(ChatColor.GREEN + "Set " + count + " lands for sale at " + formatCoin(price) + " coins");
             } else {
                 player.sendMessage(ChatColor.YELLOW + "No lands you own found in selection");
             }
@@ -2102,7 +2099,7 @@ public class LandCoin extends JavaPlugin implements Listener {
             }
 
             if (count > 0) {
-                plugin.getDataManager().saveAll();
+                plugin.getDataManager().saveAllAsync();
                 player.sendMessage(ChatColor.GREEN + "Removed sale from " + count + " lands");
             } else {
                 player.sendMessage(ChatColor.YELLOW + "No lands you own found in selection");
@@ -2112,7 +2109,6 @@ public class LandCoin extends JavaPlugin implements Listener {
         public Map<String, Integer> getLandOwnershipStats(SelectionManager.Selection sel) {
             Map<String, Integer> stats = new HashMap<>();
             if (!sel.isValid()) return stats;
-            
             for (String chunkKey : sel.getChunks()) {
                 Land land = plugin.getDataManager().getLand(chunkKey);
                 if (land != null && land.getOwner() != null) {
@@ -2137,33 +2133,35 @@ public class LandCoin extends JavaPlugin implements Listener {
             return null;
         }
 
-        public boolean claimSubArea(Player player, SelectionManager.Selection sel) {
-            if (!sel.isValid()) return false;
+        public void claimSubArea(Player player, SelectionManager.Selection sel) {
+            if (!sel.isValid()) {
+                player.sendMessage(ChatColor.RED + "Make a selection first with /selection!");
+                return;
+            }
 
             UUID owner = null;
             for (String chunkKey : sel.getChunks()) {
                 Land land = plugin.getDataManager().getLand(chunkKey);
                 if (land == null) {
                     player.sendMessage(ChatColor.RED + "All chunks must be claimed first!");
-                    return false;
+                    return;
                 }
                 if (owner == null) {
                     owner = land.getOwner();
                 } else if (!land.getOwner().equals(owner)) {
                     player.sendMessage(ChatColor.RED + "All chunks must belong to the same owner!");
-                    return false;
+                    return;
                 }
             }
 
             if (owner == null) {
                 player.sendMessage(ChatColor.RED + "No lands found!");
-                return false;
+                return;
             }
 
-            // Verificar se o jogador é o dono da land ou tem permissão de admin
             if (!owner.equals(player.getUniqueId()) && !player.hasPermission("landcoin.admin")) {
                 player.sendMessage(ChatColor.RED + "Only the land owner can create sub-areas!");
-                return false;
+                return;
             }
 
             for (String chunkKey : sel.getChunks()) {
@@ -2171,7 +2169,7 @@ public class LandCoin extends JavaPlugin implements Listener {
                 for (SubArea area : land.getSubAreas().values()) {
                     if (sel.overlaps(area)) {
                         player.sendMessage(ChatColor.RED + "Selection overlaps with existing sub-area!");
-                        return false;
+                        return;
                     }
                 }
             }
@@ -2185,10 +2183,8 @@ public class LandCoin extends JavaPlugin implements Listener {
             }
             
             plugin.getDataManager().addSubArea(area);
-            plugin.getDataManager().saveAll();
-
+            plugin.getDataManager().saveAllAsync();
             player.sendMessage(ChatColor.GREEN + "Sub-area created with ID: " + id);
-            return true;
         }
 
         public void setSubAreaPermissions(Player player, SubArea area, Role role, PermissionType perm, boolean value) {
@@ -2199,9 +2195,8 @@ public class LandCoin extends JavaPlugin implements Listener {
                     return;
                 }
             }
-
             area.getPermissions().setPermission(role, perm, value);
-            plugin.getDataManager().saveAll();
+            plugin.getDataManager().saveAllAsync();
             player.sendMessage(ChatColor.GREEN + "Set permission " + perm + " to " + value + " for role " + role + " in this sub-area");
         }
 
@@ -2213,15 +2208,12 @@ public class LandCoin extends JavaPlugin implements Listener {
                     return;
                 }
             }
-
             for (String chunkKey : area.getChunkKeys()) {
                 Land land = plugin.getDataManager().getLand(chunkKey);
-                if (land != null) {
-                    land.removeSubArea(area.getId());
-                }
+                if (land != null) land.removeSubArea(area.getId());
             }
             plugin.getDataManager().removeSubArea(area.getId());
-            plugin.getDataManager().saveAll();
+            plugin.getDataManager().saveAllAsync();
             player.sendMessage(ChatColor.GREEN + "Sub-area deleted");
         }
 
@@ -2230,7 +2222,6 @@ public class LandCoin extends JavaPlugin implements Listener {
                 player.sendMessage(ChatColor.RED + "Price must be positive!");
                 return;
             }
-            
             for (String chunkKey : area.getChunkKeys()) {
                 Land land = plugin.getDataManager().getLand(chunkKey);
                 if (land == null || (!land.getOwner().equals(player.getUniqueId()) && !player.hasPermission("landcoin.admin"))) {
@@ -2238,21 +2229,19 @@ public class LandCoin extends JavaPlugin implements Listener {
                     return;
                 }
             }
-
             area.setForRent(price);
-            plugin.getDataManager().saveAll();
+            plugin.getDataManager().saveAllAsync();
             player.sendMessage(ChatColor.GREEN + "Sub-area set for rent at " + formatCoin(price) + " coins/day");
         }
 
-        public boolean rentSubArea(Player player, SubArea area) {
+        public void rentSubArea(Player player, SubArea area) {
             if (!area.isForRent()) {
                 player.sendMessage(ChatColor.RED + "This sub-area is not for rent!");
-                return false;
+                return;
             }
-
             if (area.hasRenter()) {
                 player.sendMessage(ChatColor.RED + "This sub-area is already rented!");
-                return false;
+                return;
             }
 
             UUID owner = null;
@@ -2260,24 +2249,23 @@ public class LandCoin extends JavaPlugin implements Listener {
                 Land land = plugin.getDataManager().getLand(chunkKey);
                 if (land == null) {
                     player.sendMessage(ChatColor.RED + "Some lands containing this sub-area are no longer claimed!");
-                    return false;
+                    return;
                 }
                 if (owner == null) {
                     owner = land.getOwner();
                 } else if (!land.getOwner().equals(owner)) {
                     player.sendMessage(ChatColor.RED + "Sub-area spans lands with different owners!");
-                    return false;
+                    return;
                 }
             }
 
-            if (owner == null) return false;
-
+            if (owner == null) return;
             final UUID finalOwner = owner;
 
             String serverCard = plugin.getConfigManager().getServerCard();
             if (serverCard == null || serverCard.isEmpty()) {
                 player.sendMessage(ChatColor.RED + "Server card not configured!");
-                return false;
+                return;
             }
 
             double price = area.getRentalPrice();
@@ -2287,7 +2275,7 @@ public class LandCoin extends JavaPlugin implements Listener {
             String playerCard = plugin.getCoinCardAPI().getPlayerCard(player.getUniqueId());
             if (playerCard == null) {
                 player.sendMessage(ChatColor.RED + "You don't have a card set!");
-                return false;
+                return;
             }
 
             plugin.getCoinCardAPI().getBalance(playerCard, new BalanceCallback() {
@@ -2297,27 +2285,21 @@ public class LandCoin extends JavaPlugin implements Listener {
                         player.sendMessage(ChatColor.RED + "Error checking balance: " + error);
                         return;
                     }
-
                     if (balance < total) {
                         player.sendMessage(ChatColor.RED + "Insufficient balance! Need " + formatCoin(total));
                         return;
                     }
 
                     String ownerCard = plugin.getCoinCardAPI().getPlayerCard(finalOwner);
-
                     plugin.getTransactionQueue().enqueue(playerCard, ownerCard, price, new TransferCallback() {
                         @Override
                         public void onSuccess(String txId, double amount) {
                             plugin.getTransactionQueue().enqueue(playerCard, serverCard, tax, null);
-
                             long expiry = System.currentTimeMillis() + 86400000L;
                             area.setRole(player.getUniqueId(), Role.RENT);
-
                             PlayerData data = plugin.getDataManager().getPlayer(player.getUniqueId());
                             data.addRentedSubArea(area.getId(), expiry);
-
-                            plugin.getDataManager().saveAll();
-
+                            plugin.getDataManager().saveAllAsync();
                             player.sendMessage(ChatColor.GREEN + "You rented this sub-area for 24 hours for " +
                                     formatCoin(total) + " coins (TX: " + txId + ")");
                             player.sendMessage(ChatColor.YELLOW + "This rental will be automatically renewed every 24 hours if you have sufficient funds.");
@@ -2330,17 +2312,13 @@ public class LandCoin extends JavaPlugin implements Listener {
                     });
                 }
             });
-
-            return true;
         }
 
         public void unrentSubArea(Player player, SubArea area) {
             area.removeMember(player.getUniqueId());
-            
             PlayerData data = plugin.getDataManager().getPlayer(player.getUniqueId());
             data.removeRentedSubArea(area.getId());
-            
-            plugin.getDataManager().saveAll();
+            plugin.getDataManager().saveAllAsync();
             player.sendMessage(ChatColor.GREEN + "You are no longer renting this sub-area");
         }
 
@@ -2352,18 +2330,14 @@ public class LandCoin extends JavaPlugin implements Listener {
                     return;
                 }
             }
-            
             if (role == Role.OWNER || role == Role.NONE || role == Role.RENT || role == Role.BUYER) {
                 player.sendMessage(ChatColor.RED + "Invalid role! Choose ASSIST, TRUST, MEMBER, or UNTRUSTED.");
                 return;
             }
-
             area.setRole(targetUUID, role);
-            plugin.getDataManager().saveAll();
-            
+            plugin.getDataManager().saveAllAsync();
             String targetName = Bukkit.getOfflinePlayer(targetUUID).getName();
             player.sendMessage(ChatColor.GREEN + targetName + " now has role " + role + " in this sub-area");
-            
             Player target = Bukkit.getPlayer(targetUUID);
             if (target != null && target.isOnline()) {
                 if (role == Role.UNTRUSTED) {
@@ -2382,13 +2356,10 @@ public class LandCoin extends JavaPlugin implements Listener {
                     return;
                 }
             }
-
             area.removeMember(targetUUID);
-            plugin.getDataManager().saveAll();
-            
+            plugin.getDataManager().saveAllAsync();
             String targetName = Bukkit.getOfflinePlayer(targetUUID).getName();
             player.sendMessage(ChatColor.GREEN + targetName + " no longer has trust in this sub-area");
-            
             Player target = Bukkit.getPlayer(targetUUID);
             if (target != null && target.isOnline()) {
                 target.sendMessage(ChatColor.RED + "You lost trust in a sub-area owned by " + player.getName());
@@ -2452,12 +2423,10 @@ public class LandCoin extends JavaPlugin implements Listener {
             public Set<String> getChunks() {
                 Set<String> chunks = new HashSet<>();
                 if (!isValid()) return chunks;
-
                 int minX = Math.min(pos1.getChunk().getX(), pos2.getChunk().getX());
                 int maxX = Math.max(pos1.getChunk().getX(), pos2.getChunk().getX());
                 int minZ = Math.min(pos1.getChunk().getZ(), pos2.getChunk().getZ());
                 int maxZ = Math.max(pos1.getChunk().getZ(), pos2.getChunk().getZ());
-
                 for (int x = minX; x <= maxX; x++) {
                     for (int z = minZ; z <= maxZ; z++) {
                         chunks.add(pos1.getWorld().getName() + "," + x + "," + z);
@@ -2475,7 +2444,6 @@ public class LandCoin extends JavaPlugin implements Listener {
                 int maxY1 = Math.max(pos1.getBlockY(), pos2.getBlockY());
                 int minZ1 = Math.min(pos1.getBlockZ(), pos2.getBlockZ());
                 int maxZ1 = Math.max(pos1.getBlockZ(), pos2.getBlockZ());
-
                 return !(maxX1 < area.minX || minX1 > area.maxX ||
                         maxY1 < area.minY || minY1 > area.maxY ||
                         maxZ1 < area.minZ || minZ1 > area.maxZ);
@@ -2486,12 +2454,12 @@ public class LandCoin extends JavaPlugin implements Listener {
     public static class TaxManager {
         private final LandCoin plugin;
         private BukkitTask taxTask;
-        private long lastTaxTime;
-        private final List<PendingNotification> pendingNotifications = new ArrayList<>();
+        private final AtomicLong lastTaxTime = new AtomicLong();
+        private final List<PendingNotification> pendingNotifications = new CopyOnWriteArrayList<>();
 
         public TaxManager(LandCoin plugin) {
             this.plugin = plugin;
-            this.lastTaxTime = System.currentTimeMillis();
+            this.lastTaxTime.set(System.currentTimeMillis());
         }
 
         public void startTimer() {
@@ -2500,7 +2468,7 @@ public class LandCoin extends JavaPlugin implements Listener {
                 public void run() {
                     checkTaxes();
                 }
-            }.runTaskTimer(plugin, 1200L, 600L);
+            }.runTaskTimerAsynchronously(plugin, 1200L, 600L);
         }
 
         public void stopTimer() {
@@ -2508,16 +2476,20 @@ public class LandCoin extends JavaPlugin implements Listener {
         }
 
         public void forceProcessNextDay() {
-            lastTaxTime = 0;
+            lastTaxTime.set(0);
             checkTaxes();
             plugin.getRentalManager().forceProcessNextDay();
         }
 
         private void checkTaxes() {
+            // Check if daily tax is enabled - if false, skip all tax processing
+            if (!plugin.getConfigManager().isDailyTax()) {
+                return;
+            }
+            
             long now = System.currentTimeMillis();
-            if (now - lastTaxTime < 86400000L) return;
-
-            lastTaxTime = now;
+            if (now - lastTaxTime.get() < 86400000L) return;
+            lastTaxTime.set(now);
             processTaxes();
         }
 
@@ -2528,114 +2500,115 @@ public class LandCoin extends JavaPlugin implements Listener {
                 return;
             }
 
-            Map<UUID, List<Land>> playerLands = new HashMap<>();
-            for (Land land : plugin.getDataManager().getLands()) {
-                if (land.getOwner() != null) {
-                    playerLands.computeIfAbsent(land.getOwner(), k -> new ArrayList<>()).add(land);
-                }
-            }
-
-            for (Map.Entry<UUID, List<Land>> entry : playerLands.entrySet()) {
-                UUID playerId = entry.getKey();
-                List<Land> lands = entry.getValue();
-
-                final List<Land> finalLands = new ArrayList<>(lands);
-
-                double totalTax = finalLands.size() * plugin.getConfigManager().getLandDailyTax();
-                String playerCard = plugin.getCoinCardAPI().getPlayerCard(playerId);
-
-                if (playerCard == null) {
-                    for (Land land : finalLands) {
-                        plugin.getDataManager().removeLand(land.getChunkKey());
-                        PlayerData data = plugin.getDataManager().getPlayer(playerId);
-                        data.addTaxLostLand(land.getChunkKey());
+            CompletableFuture.runAsync(() -> {
+                Map<UUID, List<Land>> playerLands = new HashMap<>();
+                for (Land land : plugin.getDataManager().getLands()) {
+                    if (land.getOwner() != null) {
+                        playerLands.computeIfAbsent(land.getOwner(), k -> new ArrayList<>()).add(land);
                     }
-                    plugin.getDataManager().saveAll();
-                    
-                    String message = ChatColor.RED + "You lost " + finalLands.size() + " lands due to missing card configuration!";
-                    PendingNotification notification = new PendingNotification(
-                            playerId, message, PendingNotification.NotificationType.TAX_LOST);
-                    pendingNotifications.add(notification);
-                    
-                    Player player = Bukkit.getPlayer(playerId);
-                    if (player != null && player.isOnline()) {
-                        player.sendMessage(message);
-                        pendingNotifications.removeIf(n -> n.getPlayerId().equals(playerId) && n.getMessage().equals(message));
-                    }
-                    continue;
                 }
 
-                plugin.getCoinCardAPI().getBalance(playerCard, new BalanceCallback() {
-                    @Override
-                    public void onResult(double balance, String error) {
-                        if (error != null || balance < totalTax) {
-                            List<Land> sorted = new ArrayList<>(finalLands);
-                            sorted.sort((a, b) -> Long.compare(b.hashCode(), a.hashCode()));
+                for (Map.Entry<UUID, List<Land>> entry : playerLands.entrySet()) {
+                    UUID playerId = entry.getKey();
+                    List<Land> lands = entry.getValue();
+                    final List<Land> finalLands = new ArrayList<>(lands);
+                    double totalTax = finalLands.size() * plugin.getConfigManager().getLandDailyTax();
+                    String playerCard = plugin.getCoinCardAPI().getPlayerCard(playerId);
 
-                            double remainingBalance = balance;
-                            List<String> lostLands = new ArrayList<>();
-
-                            for (Land land : sorted) {
-                                if (remainingBalance < plugin.getConfigManager().getLandDailyTax()) {
-                                    plugin.getDataManager().removeLand(land.getChunkKey());
-                                    lostLands.add(land.getChunkKey());
-                                    PlayerData data = plugin.getDataManager().getPlayer(playerId);
-                                    data.addTaxLostLand(land.getChunkKey());
-                                } else {
-                                    remainingBalance -= plugin.getConfigManager().getLandDailyTax();
-                                }
-                            }
-                            
-                            plugin.getDataManager().saveAll();
-                            
-                            if (!lostLands.isEmpty()) {
-                                String message = ChatColor.RED + "You lost " + lostLands.size() + 
-                                        " lands due to insufficient funds for taxes!";
-                                PendingNotification notification = new PendingNotification(
-                                        playerId, message, PendingNotification.NotificationType.TAX_LOST);
-                                pendingNotifications.add(notification);
-                                
-                                Player player = Bukkit.getPlayer(playerId);
-                                if (player != null && player.isOnline()) {
-                                    player.sendMessage(message);
-                                    pendingNotifications.removeIf(n -> n.getPlayerId().equals(playerId) && n.getMessage().equals(message));
-                                }
-                            }
-                            return;
+                    if (playerCard == null) {
+                        for (Land land : finalLands) {
+                            plugin.getDataManager().removeLand(land.getChunkKey());
+                            PlayerData data = plugin.getDataManager().getPlayer(playerId);
+                            data.addTaxLostLand(land.getChunkKey());
                         }
-
-                        plugin.getTransactionQueue().enqueue(playerCard, serverCard, totalTax, new TransferCallback() {
+                        plugin.getDataManager().saveAllAsync();
+                        String message = ChatColor.RED + "You lost " + finalLands.size() + " lands due to missing card configuration!";
+                        PendingNotification notification = new PendingNotification(playerId, message, PendingNotification.NotificationType.TAX_LOST);
+                        pendingNotifications.add(notification);
+                        new BukkitRunnable() {
                             @Override
-                            public void onSuccess(String txId, double amount) {
-                                plugin.getLogger().info("Tax collected from " + playerId + ": " + amount + " coins");
-                            }
-
-                            @Override
-                            public void onFailure(String error) {
-                                plugin.getLogger().warning("Tax collection failed for " + playerId + " after max attempts: " + error);
-                                for (Land land : finalLands) {
-                                    plugin.getDataManager().removeLand(land.getChunkKey());
-                                    PlayerData data = plugin.getDataManager().getPlayer(playerId);
-                                    data.addTaxLostLand(land.getChunkKey());
-                                }
-                                plugin.getDataManager().saveAll();
-                                
-                                String message = ChatColor.RED + "You lost " + finalLands.size() + 
-                                        " lands due to tax payment failure!";
-                                PendingNotification notification = new PendingNotification(
-                                        playerId, message, PendingNotification.NotificationType.TAX_LOST);
-                                pendingNotifications.add(notification);
-                                
+                            public void run() {
                                 Player player = Bukkit.getPlayer(playerId);
                                 if (player != null && player.isOnline()) {
                                     player.sendMessage(message);
                                     pendingNotifications.removeIf(n -> n.getPlayerId().equals(playerId) && n.getMessage().equals(message));
                                 }
                             }
-                        });
+                        }.runTask(plugin);
+                        continue;
                     }
-                });
-            }
+
+                    plugin.getCoinCardAPI().getBalance(playerCard, new BalanceCallback() {
+                        @Override
+                        public void onResult(double balance, String error) {
+                            if (error != null || balance < totalTax) {
+                                List<Land> sorted = new ArrayList<>(finalLands);
+                                sorted.sort((a, b) -> Long.compare(b.hashCode(), a.hashCode()));
+                                double remainingBalance = balance;
+                                List<String> lostLands = new ArrayList<>();
+                                for (Land land : sorted) {
+                                    if (remainingBalance < plugin.getConfigManager().getLandDailyTax()) {
+                                        plugin.getDataManager().removeLand(land.getChunkKey());
+                                        lostLands.add(land.getChunkKey());
+                                        PlayerData data = plugin.getDataManager().getPlayer(playerId);
+                                        data.addTaxLostLand(land.getChunkKey());
+                                    } else {
+                                        remainingBalance -= plugin.getConfigManager().getLandDailyTax();
+                                    }
+                                }
+                                plugin.getDataManager().saveAllAsync();
+                                if (!lostLands.isEmpty()) {
+                                    String message = ChatColor.RED + "You lost " + lostLands.size() + " lands due to insufficient funds for taxes!";
+                                    PendingNotification notification = new PendingNotification(playerId, message, PendingNotification.NotificationType.TAX_LOST);
+                                    pendingNotifications.add(notification);
+                                    new BukkitRunnable() {
+                                        @Override
+                                        public void run() {
+                                            Player player = Bukkit.getPlayer(playerId);
+                                            if (player != null && player.isOnline()) {
+                                                player.sendMessage(message);
+                                                pendingNotifications.removeIf(n -> n.getPlayerId().equals(playerId) && n.getMessage().equals(message));
+                                            }
+                                        }
+                                    }.runTask(plugin);
+                                }
+                                return;
+                            }
+
+                            plugin.getTransactionQueue().enqueue(playerCard, serverCard, totalTax, new TransferCallback() {
+                                @Override
+                                public void onSuccess(String txId, double amount) {
+                                    plugin.getLogger().info("Tax collected from " + playerId + ": " + amount + " coins");
+                                }
+
+                                @Override
+                                public void onFailure(String error) {
+                                    plugin.getLogger().warning("Tax collection failed for " + playerId + " after max attempts: " + error);
+                                    for (Land land : finalLands) {
+                                        plugin.getDataManager().removeLand(land.getChunkKey());
+                                        PlayerData data = plugin.getDataManager().getPlayer(playerId);
+                                        data.addTaxLostLand(land.getChunkKey());
+                                    }
+                                    plugin.getDataManager().saveAllAsync();
+                                    String message = ChatColor.RED + "You lost " + finalLands.size() + " lands due to tax payment failure!";
+                                    PendingNotification notification = new PendingNotification(playerId, message, PendingNotification.NotificationType.TAX_LOST);
+                                    pendingNotifications.add(notification);
+                                    new BukkitRunnable() {
+                                        @Override
+                                        public void run() {
+                                            Player player = Bukkit.getPlayer(playerId);
+                                            if (player != null && player.isOnline()) {
+                                                player.sendMessage(message);
+                                                pendingNotifications.removeIf(n -> n.getPlayerId().equals(playerId) && n.getMessage().equals(message));
+                                            }
+                                        }
+                                    }.runTask(plugin);
+                                }
+                            });
+                        }
+                    });
+                }
+            }, LandCoin.getAsyncExecutor());
         }
 
         public List<PendingNotification> getPendingNotifications(UUID playerId) {
@@ -2761,57 +2734,33 @@ public class LandCoin extends JavaPlugin implements Listener {
     }
 
     public class LandCommand implements CommandExecutor, TabCompleter {
-
+        // Command implementation
         @Override
         public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
             if (!(sender instanceof Player) && (args.length == 0 || !args[0].equalsIgnoreCase("reload") && !args[0].equalsIgnoreCase("admin"))) {
                 sender.sendMessage(ChatColor.RED + "Only players can use this command!");
                 return true;
             }
-
             Player player = (Player) sender;
-
-            if (args.length == 0) {
-                sendHelp(player);
-                return true;
-            }
-
+            if (args.length == 0) { sendHelp(player); return true; }
             String sub = args[0].toLowerCase();
-
             switch (sub) {
-                case "claim":
-                    return handleClaim(player, args);
-                case "unclaim":
-                    return handleUnclaim(player, args);
-                case "area":
-                    return handleArea(player, args);
-                case "set":
-                    return handleSet(player, args);
-                case "rent":
-                    return handleRent(player, args);
-                case "unrent":
-                    return handleUnrent(player, args);
-                case "rental":
-                    return handleRental(player, args);
-                case "sell":
-                    return handleSell(player, args);
-                case "buy":
-                    return handleBuy(player, args);
-                case "info":
-                    return handleInfo(player, args);
-                case "view":
-                    return handleView(player, args);
-                case "trust":
-                    return handleTrust(player, args);
-                case "untrust":
-                    return handleUntrust(player, args);
-                case "admin":
-                    return handleAdmin(player, args);
-                case "reload":
-                    return handleReload(player);
-                default:
-                    sendHelp(player);
-                    return true;
+                case "claim": return handleClaim(player, args);
+                case "unclaim": return handleUnclaim(player, args);
+                case "area": return handleArea(player, args);
+                case "set": return handleSet(player, args);
+                case "rent": return handleRent(player, args);
+                case "unrent": return handleUnrent(player, args);
+                case "rental": return handleRental(player, args);
+                case "sell": return handleSell(player, args);
+                case "buy": return handleBuy(player, args);
+                case "info": return handleInfo(player, args);
+                case "view": return handleView(player, args);
+                case "trust": return handleTrust(player, args);
+                case "untrust": return handleUntrust(player, args);
+                case "admin": return handleAdmin(player, args);
+                case "reload": return handleReload(player);
+                default: sendHelp(player); return true;
             }
         }
 
@@ -2823,7 +2772,7 @@ public class LandCoin extends JavaPlugin implements Listener {
             player.sendMessage(ChatColor.YELLOW + "/land area unclaim " + ChatColor.GRAY + "- Delete sub-area");
             player.sendMessage(ChatColor.YELLOW + "/land set <role> <break/place/access/use> <true/false> " + ChatColor.GRAY + "- Set permissions in selection");
             player.sendMessage(ChatColor.YELLOW + "/land area set <role> <break/place/access/use> <true/false> " + ChatColor.GRAY + "- Set permissions in sub-area");
-            player.sendMessage(ChatColor.YELLOW + "/land rent " + ChatColor.GRAY + "- Rent current land");
+            player.sendMessage(ChatColor.YELLOW + "/land rent " + ChatColor.GRAY + "- Rent selected lands");
             player.sendMessage(ChatColor.YELLOW + "/land area rent " + ChatColor.GRAY + "- Rent current sub-area");
             player.sendMessage(ChatColor.YELLOW + "/land unrent [all/area] " + ChatColor.GRAY + "- Stop renting");
             player.sendMessage(ChatColor.YELLOW + "/land rental <price> " + ChatColor.GRAY + "- Set lands in selection for rent");
@@ -2850,7 +2799,8 @@ public class LandCoin extends JavaPlugin implements Listener {
                 player.sendMessage(ChatColor.RED + "Make a selection first with /selection!");
                 return true;
             }
-            return landManager.claimLand(player, sel);
+            landManager.claimLand(player, sel);
+            return true;
         }
 
         private boolean handleUnclaim(Player player, String[] args) {
@@ -2859,7 +2809,8 @@ public class LandCoin extends JavaPlugin implements Listener {
                 player.sendMessage(ChatColor.RED + "Make a selection first with /selection!");
                 return true;
             }
-            return landManager.unclaimLand(player, sel);
+            landManager.unclaimLand(player, sel);
+            return true;
         }
 
         private boolean handleArea(Player player, String[] args) {
@@ -2867,9 +2818,7 @@ public class LandCoin extends JavaPlugin implements Listener {
                 player.sendMessage(ChatColor.RED + "Usage: /land area <claim/unclaim/set/rental/rent/unrent/trust/untrust>");
                 return true;
             }
-
             String sub = args[1].toLowerCase();
-
             switch (sub) {
                 case "claim":
                     if (args.length < 3) {
@@ -2881,8 +2830,8 @@ public class LandCoin extends JavaPlugin implements Listener {
                         player.sendMessage(ChatColor.RED + "Make a selection first with /selection!");
                         return true;
                     }
-                    return subAreaManager.claimSubArea(player, sel);
-
+                    subAreaManager.claimSubArea(player, sel);
+                    return true;
                 case "unclaim":
                     SubArea area = subAreaManager.getSubAreaAt(player.getLocation());
                     if (area == null) {
@@ -2891,30 +2840,25 @@ public class LandCoin extends JavaPlugin implements Listener {
                     }
                     subAreaManager.unclaimSubArea(player, area);
                     return true;
-
                 case "set":
                     if (args.length < 5) {
                         player.sendMessage(ChatColor.RED + "Usage: /land area set <role> <break/place/access/use> <true/false>");
                         return true;
                     }
-                    
                     SubArea areaToSet = subAreaManager.getSubAreaAt(player.getLocation());
                     if (areaToSet == null) {
                         player.sendMessage(ChatColor.RED + "You are not in a sub-area!");
                         return true;
                     }
-                    
                     try {
                         Role role = Role.valueOf(args[2].toUpperCase());
                         PermissionType perm = PermissionType.valueOf(args[3].toUpperCase());
                         boolean value = Boolean.parseBoolean(args[4]);
-                        
                         subAreaManager.setSubAreaPermissions(player, areaToSet, role, perm, value);
                     } catch (IllegalArgumentException e) {
-                        player.sendMessage(ChatColor.RED + "Invalid role or permission type! Available roles: OWNER, ASSIST, TRUST, MEMBER, RENT, BUYER, UNTRUSTED");
+                        player.sendMessage(ChatColor.RED + "Invalid role or permission type!");
                     }
                     return true;
-
                 case "rental":
                     if (args.length < 3) {
                         player.sendMessage(ChatColor.RED + "Usage: /land area rental <price>");
@@ -2932,15 +2876,14 @@ public class LandCoin extends JavaPlugin implements Listener {
                         player.sendMessage(ChatColor.RED + "Invalid price!");
                     }
                     return true;
-
                 case "rent":
                     SubArea areaToRent = subAreaManager.getSubAreaAt(player.getLocation());
                     if (areaToRent == null) {
                         player.sendMessage(ChatColor.RED + "You are not in a sub-area!");
                         return true;
                     }
-                    return subAreaManager.rentSubArea(player, areaToRent);
-
+                    subAreaManager.rentSubArea(player, areaToRent);
+                    return true;
                 case "unrent":
                     SubArea areaToUnrent = subAreaManager.getSubAreaAt(player.getLocation());
                     if (areaToUnrent == null) {
@@ -2949,7 +2892,6 @@ public class LandCoin extends JavaPlugin implements Listener {
                     }
                     subAreaManager.unrentSubArea(player, areaToUnrent);
                     return true;
-
                 case "trust":
                     if (args.length < 3) {
                         player.sendMessage(ChatColor.RED + "Usage: /land area trust <player> [role]");
@@ -2960,26 +2902,22 @@ public class LandCoin extends JavaPlugin implements Listener {
                         player.sendMessage(ChatColor.RED + "You are not in a sub-area!");
                         return true;
                     }
-                    
                     UUID targetUUID = getPlayerUUID(args[2]);
                     if (targetUUID == null) {
                         player.sendMessage(ChatColor.RED + "Player not found!");
                         return true;
                     }
-                    
                     Role role = Role.TRUST;
                     if (args.length >= 4) {
                         try {
                             role = Role.valueOf(args[3].toUpperCase());
                         } catch (IllegalArgumentException e) {
-                            player.sendMessage(ChatColor.RED + "Invalid role! Use ASSIST, TRUST, MEMBER, or UNTRUSTED.");
+                            player.sendMessage(ChatColor.RED + "Invalid role!");
                             return true;
                         }
                     }
-                    
                     subAreaManager.trustSubArea(player, areaToTrust, targetUUID, role);
                     return true;
-
                 case "untrust":
                     if (args.length < 3) {
                         player.sendMessage(ChatColor.RED + "Usage: /land area untrust <player>");
@@ -2997,7 +2935,6 @@ public class LandCoin extends JavaPlugin implements Listener {
                     }
                     subAreaManager.untrustSubArea(player, areaToUntrust, targetUUID);
                     return true;
-
                 default:
                     player.sendMessage(ChatColor.RED + "Unknown area command");
                     return true;
@@ -3009,17 +2946,14 @@ public class LandCoin extends JavaPlugin implements Listener {
                 player.sendMessage(ChatColor.RED + "Usage: /land set <role> <break/place/access/use> <true/false>");
                 return true;
             }
-
             try {
                 Role role = Role.valueOf(args[1].toUpperCase());
                 PermissionType perm = PermissionType.valueOf(args[2].toUpperCase());
                 boolean value = Boolean.parseBoolean(args[3]);
-
                 SelectionManager.Selection sel = selectionManager.getSelection(player.getUniqueId());
                 landManager.setPermissionsInSelection(player, sel, role, perm, value);
-                
             } catch (IllegalArgumentException e) {
-                player.sendMessage(ChatColor.RED + "Invalid role or permission type! Available roles: OWNER, ASSIST, TRUST, MEMBER, RENT, BUYER, UNTRUSTED");
+                player.sendMessage(ChatColor.RED + "Invalid role or permission type!");
             }
             return true;
         }
@@ -3031,14 +2965,30 @@ public class LandCoin extends JavaPlugin implements Listener {
                     player.sendMessage(ChatColor.RED + "You are not in a sub-area!");
                     return true;
                 }
-                return subAreaManager.rentSubArea(player, area);
+                subAreaManager.rentSubArea(player, area);
+                return true;
             } else {
-                Land land = landManager.getLandAt(player.getLocation());
-                if (land == null) {
-                    player.sendMessage(ChatColor.RED + "You are not in a claimed land!");
+                SelectionManager.Selection sel = selectionManager.getSelection(player.getUniqueId());
+                if (!sel.isValid()) {
+                    player.sendMessage(ChatColor.RED + "Make a selection first with /selection!");
                     return true;
                 }
-                return landManager.rentLand(player, land);
+                List<Land> landsToRent = new ArrayList<>();
+                for (String chunkKey : sel.getChunks()) {
+                    Land land = dataManager.getLand(chunkKey);
+                    if (land != null && land.isForRent() && !land.hasRenter()) {
+                        landsToRent.add(land);
+                    }
+                }
+                if (landsToRent.isEmpty()) {
+                    player.sendMessage(ChatColor.RED + "No rentable lands found in selection!");
+                    return true;
+                }
+                for (Land land : landsToRent) {
+                    landManager.rentLand(player, land);
+                }
+                player.sendMessage(ChatColor.GREEN + "Processing rental for " + landsToRent.size() + " lands...");
+                return true;
             }
         }
 
@@ -3047,15 +2997,14 @@ public class LandCoin extends JavaPlugin implements Listener {
                 if (args[1].equalsIgnoreCase("all")) {
                     for (Land land : dataManager.getLands()) {
                         if (land.getRole(player.getUniqueId()) == Role.RENT) {
-                            land.removeMember(player.getUniqueId());
+                            landManager.unrentLand(player, land);
                         }
                     }
                     for (SubArea area : dataManager.getSubAreas()) {
                         if (area.getRole(player.getUniqueId()) == Role.RENT) {
-                            area.removeMember(player.getUniqueId());
+                            subAreaManager.unrentSubArea(player, area);
                         }
                     }
-                    dataManager.saveAll();
                     player.sendMessage(ChatColor.GREEN + "You are no longer renting any lands or sub-areas");
                 } else if (args[1].equalsIgnoreCase("area")) {
                     SubArea area = subAreaManager.getSubAreaAt(player.getLocation());
@@ -3064,13 +3013,32 @@ public class LandCoin extends JavaPlugin implements Listener {
                     } else {
                         player.sendMessage(ChatColor.RED + "You are not in a sub-area!");
                     }
+                } else {
+                    SelectionManager.Selection sel = selectionManager.getSelection(player.getUniqueId());
+                    if (!sel.isValid()) {
+                        player.sendMessage(ChatColor.RED + "Make a selection first with /selection!");
+                        return true;
+                    }
+                    int count = 0;
+                    for (String chunkKey : sel.getChunks()) {
+                        Land land = dataManager.getLand(chunkKey);
+                        if (land != null && land.getRole(player.getUniqueId()) == Role.RENT) {
+                            landManager.unrentLand(player, land);
+                            count++;
+                        }
+                    }
+                    if (count > 0) {
+                        player.sendMessage(ChatColor.GREEN + "You are no longer renting " + count + " lands in the selection.");
+                    } else {
+                        player.sendMessage(ChatColor.YELLOW + "You are not renting any lands in this selection.");
+                    }
                 }
             } else {
                 Land land = landManager.getLandAt(player.getLocation());
-                if (land != null) {
+                if (land != null && land.getRole(player.getUniqueId()) == Role.RENT) {
                     landManager.unrentLand(player, land);
                 } else {
-                    player.sendMessage(ChatColor.RED + "You are not in a claimed land!");
+                    player.sendMessage(ChatColor.RED + "You are not renting the land you are standing on!");
                 }
             }
             return true;
@@ -3081,19 +3049,16 @@ public class LandCoin extends JavaPlugin implements Listener {
                 player.sendMessage(ChatColor.RED + "Usage: /land rental <price> or /land rental remove");
                 return true;
             }
-
             if (args[1].equalsIgnoreCase("remove")) {
                 SelectionManager.Selection sel = selectionManager.getSelection(player.getUniqueId());
                 landManager.clearLandForRentInSelection(player, sel);
                 return true;
             }
-
             SelectionManager.Selection sel = selectionManager.getSelection(player.getUniqueId());
             if (!sel.isValid()) {
                 player.sendMessage(ChatColor.RED + "Make a selection first with /selection!");
                 return true;
             }
-
             try {
                 double price = Double.parseDouble(args[1]);
                 landManager.setLandForRentInSelection(player, sel, price);
@@ -3108,18 +3073,15 @@ public class LandCoin extends JavaPlugin implements Listener {
                 player.sendMessage(ChatColor.RED + "Usage: /land sell <price> or /land sell remove");
                 return true;
             }
-
             SelectionManager.Selection sel = selectionManager.getSelection(player.getUniqueId());
             if (!sel.isValid()) {
                 player.sendMessage(ChatColor.RED + "Make a selection first with /selection!");
                 return true;
             }
-
             if (args[1].equalsIgnoreCase("remove")) {
                 landManager.clearLandForSaleInSelection(player, sel);
                 return true;
             }
-
             try {
                 double price = Double.parseDouble(args[1]);
                 landManager.setLandForSaleInSelection(player, sel, price);
@@ -3135,7 +3097,8 @@ public class LandCoin extends JavaPlugin implements Listener {
                 player.sendMessage(ChatColor.RED + "Make a selection first with /selection!");
                 return true;
             }
-            return landManager.buyLand(player, sel);
+            landManager.buyLand(player, sel);
+            return true;
         }
 
         private boolean handleInfo(Player player, String[] args) {
@@ -3144,27 +3107,19 @@ public class LandCoin extends JavaPlugin implements Listener {
                 player.sendMessage(ChatColor.RED + "You are not in a claimed land!");
                 return true;
             }
-
             SubArea area = subAreaManager.getSubAreaAt(player.getLocation());
-
             player.sendMessage(ChatColor.GOLD + "=== Land Info ===");
             player.sendMessage(ChatColor.YELLOW + "Location: " + ChatColor.WHITE + land.getWorld() + " " + land.getX() + "," + land.getZ());
-            player.sendMessage(ChatColor.YELLOW + "Owner: " + ChatColor.WHITE +
-                    (land.getOwner() != null ? Bukkit.getOfflinePlayer(land.getOwner()).getName() : "None"));
+            player.sendMessage(ChatColor.YELLOW + "Owner: " + ChatColor.WHITE + (land.getOwner() != null ? Bukkit.getOfflinePlayer(land.getOwner()).getName() : "None"));
             player.sendMessage(ChatColor.YELLOW + "Your role: " + ChatColor.WHITE + land.getRole(player.getUniqueId()));
-            player.sendMessage(ChatColor.YELLOW + "For Sale: " + ChatColor.WHITE +
-                    (land.isForSale() ? formatCoin(land.getForSalePrice()) : "No"));
-            player.sendMessage(ChatColor.YELLOW + "For Rent: " + ChatColor.WHITE +
-                    (land.isForRent() ? formatCoin(land.getRentalPrice()) + "/day" : "No"));
-
+            player.sendMessage(ChatColor.YELLOW + "For Sale: " + ChatColor.WHITE + (land.isForSale() ? formatCoin(land.getForSalePrice()) : "No"));
+            player.sendMessage(ChatColor.YELLOW + "For Rent: " + ChatColor.WHITE + (land.isForRent() ? formatCoin(land.getRentalPrice()) + "/day" : "No"));
             if (area != null) {
                 player.sendMessage(ChatColor.GOLD + "=== Sub-Area Info ===");
                 player.sendMessage(ChatColor.YELLOW + "ID: " + ChatColor.WHITE + area.getId());
                 player.sendMessage(ChatColor.YELLOW + "Your role: " + ChatColor.WHITE + area.getRole(player.getUniqueId()));
-                player.sendMessage(ChatColor.YELLOW + "For Rent: " + ChatColor.WHITE +
-                        (area.isForRent() ? formatCoin(area.getRentalPrice()) + "/day" : "No"));
+                player.sendMessage(ChatColor.YELLOW + "For Rent: " + ChatColor.WHITE + (area.isForRent() ? formatCoin(area.getRentalPrice()) + "/day" : "No"));
             }
-
             int ownedLands = 0;
             for (Land l : dataManager.getLands()) {
                 if (l.getOwner() != null && l.getOwner().equals(player.getUniqueId())) ownedLands++;
@@ -3179,21 +3134,15 @@ public class LandCoin extends JavaPlugin implements Listener {
                 player.sendMessage(ChatColor.RED + "Make a selection first with /selection!");
                 return true;
             }
-            
             Map<String, Integer> stats = landManager.getLandOwnershipStats(sel);
             int totalLands = sel.getChunkCount();
             int claimedLands = stats.values().stream().mapToInt(Integer::intValue).sum();
-            
             player.sendMessage(ChatColor.GOLD + "=== Land Information ===");
             player.sendMessage(ChatColor.YELLOW + "Total lands selected: " + ChatColor.WHITE + totalLands);
             player.sendMessage(ChatColor.YELLOW + "Claimed lands: " + ChatColor.WHITE + claimedLands);
-            
             if (!stats.isEmpty()) {
                 player.sendMessage(ChatColor.YELLOW + "Owners:");
-                stats.entrySet().stream()
-                    .sorted((a, b) -> b.getValue().compareTo(a.getValue()))
-                    .forEach(entry -> player.sendMessage(ChatColor.GRAY + "  - " + entry.getKey() + ": " + 
-                            ChatColor.WHITE + entry.getValue() + " lands"));
+                stats.entrySet().stream().sorted((a, b) -> b.getValue().compareTo(a.getValue())).forEach(entry -> player.sendMessage(ChatColor.GRAY + "  - " + entry.getKey() + ": " + ChatColor.WHITE + entry.getValue() + " lands"));
             } else {
                 player.sendMessage(ChatColor.GRAY + "No claimed lands in selection");
             }
@@ -3205,51 +3154,43 @@ public class LandCoin extends JavaPlugin implements Listener {
                 player.sendMessage(ChatColor.RED + "Usage: /land trust <player> [role]");
                 return true;
             }
-
-            // Check if it's a sub-area command
             if (args.length >= 3 && args[1].equalsIgnoreCase("area")) {
                 SubArea area = subAreaManager.getSubAreaAt(player.getLocation());
                 if (area == null) {
                     player.sendMessage(ChatColor.RED + "You are not in a sub-area!");
                     return true;
                 }
-                
                 UUID targetUUID = getPlayerUUID(args[2]);
                 if (targetUUID == null) {
                     player.sendMessage(ChatColor.RED + "Player not found!");
                     return true;
                 }
-                
                 Role role = Role.TRUST;
                 if (args.length >= 4) {
                     try {
                         role = Role.valueOf(args[3].toUpperCase());
                     } catch (IllegalArgumentException e) {
-                        player.sendMessage(ChatColor.RED + "Invalid role! Use ASSIST, TRUST, MEMBER, or UNTRUSTED.");
+                        player.sendMessage(ChatColor.RED + "Invalid role!");
                         return true;
                     }
                 }
-                
                 subAreaManager.trustSubArea(player, area, targetUUID, role);
                 return true;
             } else {
-                // Land trust with selection
                 UUID targetUUID = getPlayerUUID(args[1]);
                 if (targetUUID == null) {
                     player.sendMessage(ChatColor.RED + "Player not found!");
                     return true;
                 }
-                
                 Role role = Role.TRUST;
                 if (args.length >= 3) {
                     try {
                         role = Role.valueOf(args[2].toUpperCase());
                     } catch (IllegalArgumentException e) {
-                        player.sendMessage(ChatColor.RED + "Invalid role! Use ASSIST, TRUST, MEMBER, or UNTRUSTED.");
+                        player.sendMessage(ChatColor.RED + "Invalid role!");
                         return true;
                     }
                 }
-                
                 SelectionManager.Selection sel = selectionManager.getSelection(player.getUniqueId());
                 landManager.trustLandsInSelection(player, sel, targetUUID, role);
                 return true;
@@ -3261,8 +3202,6 @@ public class LandCoin extends JavaPlugin implements Listener {
                 player.sendMessage(ChatColor.RED + "Usage: /land untrust <player>");
                 return true;
             }
-
-            // Check if it's a sub-area command
             if (args.length >= 3 && args[1].equalsIgnoreCase("area")) {
                 SubArea area = subAreaManager.getSubAreaAt(player.getLocation());
                 if (area == null) {
@@ -3277,13 +3216,11 @@ public class LandCoin extends JavaPlugin implements Listener {
                 subAreaManager.untrustSubArea(player, area, targetUUID);
                 return true;
             } else {
-                // Land untrust with selection
                 UUID targetUUID = getPlayerUUID(args[1]);
                 if (targetUUID == null) {
                     player.sendMessage(ChatColor.RED + "Player not found!");
                     return true;
                 }
-                
                 SelectionManager.Selection sel = selectionManager.getSelection(player.getUniqueId());
                 landManager.untrustLandsInSelection(player, sel, targetUUID);
                 return true;
@@ -3295,33 +3232,27 @@ public class LandCoin extends JavaPlugin implements Listener {
                 player.sendMessage(ChatColor.RED + "No permission!");
                 return true;
             }
-
             if (args.length < 2) {
                 player.sendMessage(ChatColor.RED + "Usage: /land admin <setowner/unclaim/set/selection/nextday>");
                 return true;
             }
-
             String sub = args[1].toLowerCase();
-
             switch (sub) {
                 case "setowner":
                     if (args.length < 3) {
                         player.sendMessage(ChatColor.RED + "Usage: /land admin setowner <player>");
                         return true;
                     }
-                    
                     SelectionManager.Selection sel = selectionManager.getSelection(player.getUniqueId());
                     if (!sel.isValid()) {
                         player.sendMessage(ChatColor.RED + "Make a selection first with /selection!");
                         return true;
                     }
-                    
                     UUID targetUUID = getPlayerUUID(args[2]);
                     if (targetUUID == null) {
                         player.sendMessage(ChatColor.RED + "Player not found!");
                         return true;
                     }
-                    
                     int transferred = 0;
                     for (String chunkKey : sel.getChunks()) {
                         Land land = dataManager.getLand(chunkKey);
@@ -3330,23 +3261,19 @@ public class LandCoin extends JavaPlugin implements Listener {
                             transferred++;
                         }
                     }
-                    
                     if (transferred > 0) {
-                        dataManager.saveAll();
-                        player.sendMessage(ChatColor.GREEN + "Transferred " + transferred + 
-                                " lands to " + args[2]);
+                        dataManager.saveAllAsync();
+                        player.sendMessage(ChatColor.GREEN + "Transferred " + transferred + " lands to " + args[2]);
                     } else {
                         player.sendMessage(ChatColor.YELLOW + "No lands found in selection to transfer");
                     }
                     return true;
-
                 case "unclaim":
                     sel = selectionManager.getSelection(player.getUniqueId());
                     if (!sel.isValid()) {
                         player.sendMessage(ChatColor.RED + "Make a selection first with /selection!");
                         return true;
                     }
-                    
                     int unclaimed = 0;
                     for (String chunkKey : sel.getChunks()) {
                         Land land = dataManager.getLand(chunkKey);
@@ -3355,15 +3282,13 @@ public class LandCoin extends JavaPlugin implements Listener {
                             unclaimed++;
                         }
                     }
-                    
                     if (unclaimed > 0) {
-                        dataManager.saveAll();
+                        dataManager.saveAllAsync();
                         player.sendMessage(ChatColor.GREEN + "Admin unclaimed " + unclaimed + " lands");
                     } else {
                         player.sendMessage(ChatColor.YELLOW + "No lands found in selection to unclaim");
                     }
                     return true;
-
                 case "set":
                     if (args.length < 5) {
                         player.sendMessage(ChatColor.RED + "Usage: /land admin set <role> <break/place/access/use> <true/false>");
@@ -3373,25 +3298,20 @@ public class LandCoin extends JavaPlugin implements Listener {
                         Role role = Role.valueOf(args[2].toUpperCase());
                         PermissionType perm = PermissionType.valueOf(args[3].toUpperCase());
                         boolean value = Boolean.parseBoolean(args[4]);
-
                         sel = selectionManager.getSelection(player.getUniqueId());
                         landManager.setPermissionsInSelection(player, sel, role, perm, value);
-                        
                     } catch (IllegalArgumentException e) {
-                        player.sendMessage(ChatColor.RED + "Invalid role or permission type! Available roles: OWNER, ASSIST, TRUST, MEMBER, RENT, BUYER, UNTRUSTED");
+                        player.sendMessage(ChatColor.RED + "Invalid role or permission type!");
                     }
                     return true;
-
                 case "selection":
                     player.getInventory().addItem(selectionManager.getWandItem());
                     player.sendMessage(ChatColor.GREEN + "You received the admin selection wand");
                     return true;
-
                 case "nextday":
                     taxManager.forceProcessNextDay();
                     player.sendMessage(ChatColor.GREEN + "Forced next day tax and rental processing");
                     return true;
-
                 default:
                     player.sendMessage(ChatColor.RED + "Unknown admin command");
                     return true;
@@ -3403,224 +3323,104 @@ public class LandCoin extends JavaPlugin implements Listener {
                 player.sendMessage(ChatColor.RED + "No permission!");
                 return true;
             }
-
             configManager.loadConfig();
-            dataManager.loadAll();
-            player.sendMessage(ChatColor.GREEN + "LandCoin reloaded!");
+            dataManager.loadAllAsync();
+            player.sendMessage(ChatColor.GREEN + "LandCoin reloaded asynchronously!");
             return true;
         }
 
         private UUID getPlayerUUID(String name) {
             Player online = Bukkit.getPlayer(name);
             if (online != null) return online.getUniqueId();
-            
             OfflinePlayer offline = Bukkit.getOfflinePlayer(name);
             if (offline.hasPlayedBefore()) return offline.getUniqueId();
-            
             return null;
         }
 
         @Override
         public List<String> onTabComplete(CommandSender sender, Command command, String alias, String[] args) {
             List<String> completions = new ArrayList<>();
-
             if (args.length == 1) {
-                completions.addAll(Arrays.asList(
-                        "claim", "unclaim", "area", "set", "rent", "unrent",
-                        "rental", "sell", "buy", "info", "view", "trust",
-                        "untrust", "admin", "reload"
-                ));
+                completions.addAll(Arrays.asList("claim", "unclaim", "area", "set", "rent", "unrent", "rental", "sell", "buy", "info", "view", "trust", "untrust", "admin", "reload"));
                 return filter(completions, args[0]);
             }
-
             if (args.length == 2) {
                 String sub = args[0].toLowerCase();
-                if (sub.equals("area")) {
-                    completions.addAll(Arrays.asList("claim", "unclaim", "set", "rental", "rent", "unrent", "trust", "untrust"));
-                }
-                if (sub.equals("set")) {
-                    completions.addAll(Arrays.stream(Role.values())
-                            .map(Enum::name)
-                            .filter(r -> !r.equals("NONE"))
-                            .collect(Collectors.toList()));
-                }
-                if (sub.equals("unrent")) {
-                    completions.addAll(Arrays.asList("all", "area"));
-                }
-                if (sub.equals("rental") || sub.equals("sell")) {
-                    completions.addAll(Arrays.asList("<price>", "remove"));
-                }
-                if (sub.equals("trust") || sub.equals("untrust")) {
-                    completions.addAll(getAllPlayerNames());
-                }
-                if (sub.equals("admin")) {
-                    completions.addAll(Arrays.asList("setowner", "unclaim", "set", "selection", "nextday"));
-                }
+                if (sub.equals("area")) completions.addAll(Arrays.asList("claim", "unclaim", "set", "rental", "rent", "unrent", "trust", "untrust"));
+                if (sub.equals("set")) completions.addAll(Arrays.stream(Role.values()).map(Enum::name).filter(r -> !r.equals("NONE")).collect(Collectors.toList()));
+                if (sub.equals("unrent")) completions.addAll(Arrays.asList("all", "area"));
+                if (sub.equals("rental") || sub.equals("sell")) completions.addAll(Arrays.asList("<price>", "remove"));
+                if (sub.equals("trust") || sub.equals("untrust")) completions.addAll(getAllPlayerNames());
+                if (sub.equals("admin")) completions.addAll(Arrays.asList("setowner", "unclaim", "set", "selection", "nextday"));
                 return filter(completions, args[1]);
             }
-
             if (args.length == 3) {
                 String sub = args[0].toLowerCase();
                 if (sub.equals("set")) {
-                    completions.addAll(Arrays.stream(PermissionType.values())
-                            .map(Enum::name)
-                            .map(String::toLowerCase)
-                            .collect(Collectors.toList()));
+                    completions.addAll(Arrays.stream(PermissionType.values()).map(Enum::name).map(String::toLowerCase).collect(Collectors.toList()));
                     return filter(completions, args[2]);
                 }
-                if (sub.equals("admin")) {
-                    String adminSub = args[1].toLowerCase();
-                    if (adminSub.equals("setowner")) {
-                        completions.addAll(getAllPlayerNames());
-                        return filter(completions, args[2]);
-                    }
-                    if (adminSub.equals("set")) {
-                        completions.addAll(Arrays.stream(Role.values())
-                                .map(Enum::name)
-                                .filter(r -> !r.equals("NONE"))
-                                .collect(Collectors.toList()));
-                        return filter(completions, args[2]);
-                    }
+                if (sub.equals("admin") && args[1].equalsIgnoreCase("setowner")) {
+                    completions.addAll(getAllPlayerNames());
+                    return filter(completions, args[2]);
                 }
                 if (sub.equals("trust") || sub.equals("untrust")) {
                     if (args[1].equalsIgnoreCase("area")) {
                         completions.addAll(getAllPlayerNames());
                         return filter(completions, args[2]);
                     }
-                    completions.addAll(Arrays.stream(Role.values())
-                            .map(Enum::name)
-                            .filter(r -> r.equals("ASSIST") || r.equals("TRUST") || r.equals("MEMBER") || r.equals("UNTRUSTED"))
-                            .collect(Collectors.toList()));
+                    completions.addAll(Arrays.stream(Role.values()).map(Enum::name).filter(r -> r.equals("ASSIST") || r.equals("TRUST") || r.equals("MEMBER") || r.equals("UNTRUSTED")).collect(Collectors.toList()));
                     return filter(completions, args[2]);
                 }
-                if (sub.equals("area")) {
-                    if (args[1].equalsIgnoreCase("set")) {
-                        completions.addAll(Arrays.stream(Role.values())
-                                .map(Enum::name)
-                                .filter(r -> !r.equals("NONE"))
-                                .collect(Collectors.toList()));
-                        return filter(completions, args[2]);
-                    }
-                    if (args[1].equalsIgnoreCase("trust") || args[1].equalsIgnoreCase("untrust")) {
-                        completions.addAll(getAllPlayerNames());
-                        return filter(completions, args[2]);
-                    }
-                }
             }
-
             if (args.length == 4) {
                 String sub = args[0].toLowerCase();
                 if (sub.equals("set")) {
                     completions.addAll(Arrays.asList("true", "false"));
                     return filter(completions, args[3]);
                 }
-                if (sub.equals("admin")) {
-                    if (args[1].equalsIgnoreCase("set")) {
-                        completions.addAll(Arrays.stream(PermissionType.values())
-                                .map(Enum::name)
-                                .map(String::toLowerCase)
-                                .collect(Collectors.toList()));
-                        return filter(completions, args[3]);
-                    }
-                }
-                if (sub.equals("trust") && !args[1].equalsIgnoreCase("area")) {
-                    completions.addAll(Arrays.stream(Role.values())
-                            .map(Enum::name)
-                            .filter(r -> r.equals("ASSIST") || r.equals("TRUST") || r.equals("MEMBER") || r.equals("UNTRUSTED"))
-                            .collect(Collectors.toList()));
-                    return filter(completions, args[3]);
-                }
-                if (sub.equals("area")) {
-                    if (args[1].equalsIgnoreCase("set")) {
-                        completions.addAll(Arrays.stream(PermissionType.values())
-                                .map(Enum::name)
-                                .map(String::toLowerCase)
-                                .collect(Collectors.toList()));
-                        return filter(completions, args[3]);
-                    }
-                    if (args[1].equalsIgnoreCase("trust")) {
-                        completions.addAll(Arrays.stream(Role.values())
-                                .map(Enum::name)
-                                .filter(r -> r.equals("ASSIST") || r.equals("TRUST") || r.equals("MEMBER") || r.equals("UNTRUSTED"))
-                                .collect(Collectors.toList()));
-                        return filter(completions, args[3]);
-                    }
-                }
             }
-
-            if (args.length == 5) {
-                String sub = args[0].toLowerCase();
-                if (sub.equals("admin") && args[1].equalsIgnoreCase("set")) {
-                    completions.addAll(Arrays.asList("true", "false"));
-                    return filter(completions, args[4]);
-                }
-                if (sub.equals("area") && args[1].equalsIgnoreCase("set")) {
-                    completions.addAll(Arrays.asList("true", "false"));
-                    return filter(completions, args[4]);
-                }
-            }
-
             return Collections.emptyList();
         }
 
         private List<String> filter(List<String> list, String current) {
-            return list.stream()
-                    .filter(s -> s.toLowerCase().startsWith(current.toLowerCase()))
-                    .sorted()
-                    .collect(Collectors.toList());
+            return list.stream().filter(s -> s.toLowerCase().startsWith(current.toLowerCase())).sorted().collect(Collectors.toList());
         }
         
         private List<String> getAllPlayerNames() {
-            return Arrays.stream(Bukkit.getOfflinePlayers())
-                    .map(OfflinePlayer::getName)
-                    .filter(Objects::nonNull)
-                    .sorted()
-                    .collect(Collectors.toList());
+            return Arrays.stream(Bukkit.getOfflinePlayers()).map(OfflinePlayer::getName).filter(Objects::nonNull).sorted().collect(Collectors.toList());
         }
     }
 
     public class SelectionCommand implements CommandExecutor, TabCompleter {
-
         @Override
         public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
             if (!(sender instanceof Player)) {
                 sender.sendMessage(ChatColor.RED + "Only players can use this command!");
                 return true;
             }
-
             Player player = (Player) sender;
-
             if (args.length == 0) {
                 player.getInventory().addItem(selectionManager.getWandItem());
                 player.sendMessage(ChatColor.GREEN + "You received the selection wand!");
                 return true;
             }
-
             String sub = args[0].toLowerCase();
-
             switch (sub) {
                 case "clear":
                     selectionManager.clearSelection(player.getUniqueId());
                     player.sendMessage(ChatColor.YELLOW + "Selection cleared!");
                     return true;
-
                 case "info":
                     SelectionManager.Selection sel = selectionManager.getSelection(player.getUniqueId());
                     if (!sel.isValid()) {
                         player.sendMessage(ChatColor.RED + "No valid selection!");
                     } else {
                         player.sendMessage(ChatColor.GREEN + "Selection size: " + sel.getChunkCount() + " chunks");
-                        if (sel.getPos1() != null) {
-                            player.sendMessage(ChatColor.YELLOW + "Pos1: " + sel.getPos1().getBlockX() + ", " +
-                                    sel.getPos1().getBlockY() + ", " + sel.getPos1().getBlockZ());
-                        }
-                        if (sel.getPos2() != null) {
-                            player.sendMessage(ChatColor.YELLOW + "Pos2: " + sel.getPos2().getBlockX() + ", " +
-                                    sel.getPos2().getBlockY() + ", " + sel.getPos2().getBlockZ());
-                        }
+                        if (sel.getPos1() != null) player.sendMessage(ChatColor.YELLOW + "Pos1: " + sel.getPos1().getBlockX() + ", " + sel.getPos1().getBlockY() + ", " + sel.getPos1().getBlockZ());
+                        if (sel.getPos2() != null) player.sendMessage(ChatColor.YELLOW + "Pos2: " + sel.getPos2().getBlockX() + ", " + sel.getPos2().getBlockY() + ", " + sel.getPos2().getBlockZ());
                     }
                     return true;
-
                 default:
                     player.sendMessage(ChatColor.RED + "Unknown command. Use /selection [clear/info]");
                     return true;
@@ -3629,17 +3429,12 @@ public class LandCoin extends JavaPlugin implements Listener {
 
         @Override
         public List<String> onTabComplete(CommandSender sender, Command command, String alias, String[] args) {
-            if (args.length == 1) {
-                return filter(Arrays.asList("clear", "info"), args[0]);
-            }
+            if (args.length == 1) return filter(Arrays.asList("clear", "info"), args[0]);
             return Collections.emptyList();
         }
 
         private List<String> filter(List<String> list, String current) {
-            return list.stream()
-                    .filter(s -> s.toLowerCase().startsWith(current.toLowerCase()))
-                    .sorted()
-                    .collect(Collectors.toList());
+            return list.stream().filter(s -> s.toLowerCase().startsWith(current.toLowerCase())).sorted().collect(Collectors.toList());
         }
     }
 
@@ -3681,18 +3476,13 @@ public class LandCoin extends JavaPlugin implements Listener {
 
     @EventHandler(priority = EventPriority.HIGH)
     public void onProjectileHit(ProjectileHitEvent event) {
-        // Verificar se é uma WindCharge pelo nome (compatibilidade com versões)
         if (event.getEntity().getType().name().equals("WIND_CHARGE") && event.getHitBlock() != null) {
             Location loc = event.getHitBlock().getLocation();
-            
-            // Check if the hit block is in protected land
             Land land = landManager.getLandAt(loc);
             if (land != null) {
-                // Cancel wind charge interaction with doors/gates in protected land
                 Material type = event.getHitBlock().getType();
                 String typeName = type.name();
-                if (typeName.contains("DOOR") || typeName.contains("GATE") || 
-                    typeName.contains("TRAPDOOR") || typeName.contains("FENCE_GATE")) {
+                if (typeName.contains("DOOR") || typeName.contains("GATE") || typeName.contains("TRAPDOOR") || typeName.contains("FENCE_GATE")) {
                     event.setCancelled(true);
                 }
             }
@@ -3703,54 +3493,37 @@ public class LandCoin extends JavaPlugin implements Listener {
     public void onPlayerInteract(PlayerInteractEvent event) {
         Player player = event.getPlayer();
         Block clickedBlock = event.getClickedBlock();
-
         ItemStack item = player.getInventory().getItemInMainHand();
         if (item != null && item.isSimilar(selectionManager.getWandItem())) {
             event.setCancelled(true);
-
             if (clickedBlock != null) {
                 if (event.getAction().toString().contains("LEFT_CLICK")) {
                     selectionManager.setPos1(player.getUniqueId(), clickedBlock.getLocation());
-                    player.sendMessage(ChatColor.GREEN + "Position 1 set: " +
-                            clickedBlock.getX() + ", " + clickedBlock.getY() + ", " + clickedBlock.getZ());
+                    player.sendMessage(ChatColor.GREEN + "Position 1 set: " + clickedBlock.getX() + ", " + clickedBlock.getY() + ", " + clickedBlock.getZ());
                 } else if (event.getAction().toString().contains("RIGHT_CLICK")) {
                     selectionManager.setPos2(player.getUniqueId(), clickedBlock.getLocation());
-                    player.sendMessage(ChatColor.GREEN + "Position 2 set: " +
-                            clickedBlock.getX() + ", " + clickedBlock.getY() + ", " + clickedBlock.getZ());
+                    player.sendMessage(ChatColor.GREEN + "Position 2 set: " + clickedBlock.getX() + ", " + clickedBlock.getY() + ", " + clickedBlock.getZ());
                 }
             }
             return;
         }
-
         if (clickedBlock != null) {
             Location loc = clickedBlock.getLocation();
             Material type = clickedBlock.getType();
             String typeName = type.name();
-
-            // Check for containers and interactive blocks
-            if (typeName.contains("CHEST") || typeName.contains("FURNACE") || 
-                typeName.contains("HOPPER") || typeName.contains("DISPENSER") || 
-                typeName.contains("DROPPER") || typeName.contains("SHULKER_BOX") ||
-                typeName.contains("BARREL") || typeName.contains("BLAST_FURNACE") ||
-                typeName.contains("SMOKER") || typeName.contains("BREWING_STAND") ||
-                typeName.contains("BEACON") || typeName.contains("ANVIL") ||
-                typeName.contains("GRINDSTONE") || typeName.contains("CARTOGRAPHY_TABLE") ||
-                typeName.contains("LOOM") || typeName.contains("STONECUTTER") ||
+            if (typeName.contains("CHEST") || typeName.contains("FURNACE") || typeName.contains("HOPPER") || typeName.contains("DISPENSER") || 
+                typeName.contains("DROPPER") || typeName.contains("SHULKER_BOX") || typeName.contains("BARREL") || typeName.contains("BLAST_FURNACE") ||
+                typeName.contains("SMOKER") || typeName.contains("BREWING_STAND") || typeName.contains("BEACON") || typeName.contains("ANVIL") ||
+                typeName.contains("GRINDSTONE") || typeName.contains("CARTOGRAPHY_TABLE") || typeName.contains("LOOM") || typeName.contains("STONECUTTER") ||
                 clickedBlock.getState() instanceof Container) {
-
                 if (!landManager.canAccess(player, loc)) {
                     event.setCancelled(true);
                     player.sendMessage(ChatColor.RED + "You don't have permission to access this!");
                 }
-
-            } else if (typeName.contains("DOOR") || typeName.contains("GATE") || 
-                       typeName.contains("TRAPDOOR") || typeName.contains("FENCE_GATE") ||
-                       typeName.contains("BUTTON") || typeName.contains("LEVER") ||
-                       typeName.contains("PRESSURE_PLATE") || typeName.contains("REPEATER") ||
-                       typeName.contains("COMPARATOR") || typeName.contains("DAYLIGHT_DETECTOR") ||
-                       typeName.contains("NOTE_BLOCK") || typeName.contains("JUKEBOX") ||
+            } else if (typeName.contains("DOOR") || typeName.contains("GATE") || typeName.contains("TRAPDOOR") || typeName.contains("FENCE_GATE") ||
+                       typeName.contains("BUTTON") || typeName.contains("LEVER") || typeName.contains("PRESSURE_PLATE") || typeName.contains("REPEATER") ||
+                       typeName.contains("COMPARATOR") || typeName.contains("DAYLIGHT_DETECTOR") || typeName.contains("NOTE_BLOCK") || typeName.contains("JUKEBOX") ||
                        typeName.contains("CAKE") || typeName.contains("BED")) {
-
                 if (!landManager.canUse(player, loc)) {
                     event.setCancelled(true);
                     player.sendMessage(ChatColor.RED + "You don't have permission to use this!");
@@ -3763,55 +3536,36 @@ public class LandCoin extends JavaPlugin implements Listener {
     public void onPlayerMove(PlayerMoveEvent event) {
         if (event.getFrom().getBlockX() == event.getTo().getBlockX() &&
             event.getFrom().getBlockY() == event.getTo().getBlockY() &&
-            event.getFrom().getBlockZ() == event.getTo().getBlockZ()) {
-            return;
-        }
-
+            event.getFrom().getBlockZ() == event.getTo().getBlockZ()) return;
         Player player = event.getPlayer();
-        
-        // Verificar mudança de chunks (lands)
         if (!event.getFrom().getChunk().equals(event.getTo().getChunk())) {
             Land fromLand = landManager.getLandAt(event.getFrom());
             Land toLand = landManager.getLandAt(event.getTo());
-
             UUID fromOwner = (fromLand != null) ? fromLand.getOwner() : null;
             UUID toOwner = (toLand != null) ? toLand.getOwner() : null;
-
             if (fromLand == null && toLand != null) {
-                player.sendMessage(ChatColor.GREEN + "Entering " +
-                        (toLand.getOwner() != null ? Bukkit.getOfflinePlayer(toLand.getOwner()).getName() + "'s land" : "unclaimed land"));
-            }
-            else if (fromLand != null && toLand == null) {
-                player.sendMessage(ChatColor.RED + "Leaving " +
-                        (fromLand.getOwner() != null ? Bukkit.getOfflinePlayer(fromLand.getOwner()).getName() + "'s land" : "unclaimed land"));
-            }
-            else if (fromLand != null && toLand != null) {
+                player.sendMessage(ChatColor.GREEN + "Entering " + (toLand.getOwner() != null ? Bukkit.getOfflinePlayer(toLand.getOwner()).getName() + "'s land" : "unclaimed land"));
+            } else if (fromLand != null && toLand == null) {
+                player.sendMessage(ChatColor.RED + "Leaving " + (fromLand.getOwner() != null ? Bukkit.getOfflinePlayer(fromLand.getOwner()).getName() + "'s land" : "unclaimed land"));
+            } else if (fromLand != null && toLand != null) {
                 if (!fromOwner.equals(toOwner)) {
-                    player.sendMessage(ChatColor.RED + "Leaving " +
-                            (fromLand.getOwner() != null ? Bukkit.getOfflinePlayer(fromLand.getOwner()).getName() + "'s land" : "unclaimed land"));
-                    player.sendMessage(ChatColor.GREEN + "Entering " +
-                            (toLand.getOwner() != null ? Bukkit.getOfflinePlayer(toLand.getOwner()).getName() + "'s land" : "unclaimed land"));
+                    player.sendMessage(ChatColor.RED + "Leaving " + (fromLand.getOwner() != null ? Bukkit.getOfflinePlayer(fromLand.getOwner()).getName() + "'s land" : "unclaimed land"));
+                    player.sendMessage(ChatColor.GREEN + "Entering " + (toLand.getOwner() != null ? Bukkit.getOfflinePlayer(toLand.getOwner()).getName() + "'s land" : "unclaimed land"));
                 }
             }
         }
-
-        // Verificar entrada/saída de sub-áreas
         SubArea currentArea = subAreaManager.getSubAreaAt(event.getTo());
         String previousAreaId = playerCurrentSubArea.get(player.getUniqueId());
-        
         if (currentArea == null && previousAreaId != null) {
-            // Saiu de uma sub-área
             player.sendMessage(ChatColor.AQUA + "Leaving sub-area");
             playerCurrentSubArea.remove(player.getUniqueId());
         } else if (currentArea != null) {
             String currentAreaId = currentArea.getId();
             if (previousAreaId == null) {
-                // Entrou em uma sub-área
                 player.sendMessage(ChatColor.AQUA + "Entering sub-area");
                 playerCurrentSubArea.put(player.getUniqueId(), currentAreaId);
                 currentArea.recordEntry(player.getUniqueId());
             } else if (!previousAreaId.equals(currentAreaId)) {
-                // Mudou de uma sub-área para outra
                 player.sendMessage(ChatColor.AQUA + "Leaving sub-area");
                 player.sendMessage(ChatColor.AQUA + "Entering sub-area");
                 playerCurrentSubArea.put(player.getUniqueId(), currentAreaId);
@@ -3826,42 +3580,26 @@ public class LandCoin extends JavaPlugin implements Listener {
         PlayerData data = dataManager.getPlayer(player.getUniqueId());
         data.updateName();
         data.clearExpiredRentals();
-        
         List<PendingNotification> taxNotifications = taxManager.getPendingNotifications(player.getUniqueId());
-        for (PendingNotification notification : taxNotifications) {
-            player.sendMessage(notification.getMessage());
-        }
+        for (PendingNotification notification : taxNotifications) player.sendMessage(notification.getMessage());
         taxManager.clearPendingNotifications(player.getUniqueId());
-        
         List<PendingNotification> rentalNotifications = rentalManager.getPendingNotifications(player.getUniqueId());
-        for (PendingNotification notification : rentalNotifications) {
-            player.sendMessage(notification.getMessage());
-        }
+        for (PendingNotification notification : rentalNotifications) player.sendMessage(notification.getMessage());
         rentalManager.clearPendingNotifications(player.getUniqueId());
-        
         for (Map.Entry<String, Long> entry : data.getRentedSubAreas().entrySet()) {
             long timeLeft = entry.getValue() - System.currentTimeMillis();
-            if (timeLeft > 0 && timeLeft < 3600000) {
-                player.sendMessage(ChatColor.YELLOW + "Your sub-area rental expires in less than 1 hour!");
-            }
+            if (timeLeft > 0 && timeLeft < 3600000) player.sendMessage(ChatColor.YELLOW + "Your sub-area rental expires in less than 1 hour!");
         }
-        
         for (Map.Entry<String, Long> entry : data.getRentedLands().entrySet()) {
             long timeLeft = entry.getValue() - System.currentTimeMillis();
-            if (timeLeft > 0 && timeLeft < 3600000) {
-                player.sendMessage(ChatColor.YELLOW + "Your land rental expires in less than 1 hour!");
-            }
+            if (timeLeft > 0 && timeLeft < 3600000) player.sendMessage(ChatColor.YELLOW + "Your land rental expires in less than 1 hour!");
         }
-        
         if (!data.getTaxLostLands().isEmpty()) {
-            player.sendMessage(ChatColor.RED + "You lost " + data.getTaxLostLands().size() + 
-                    " lands due to unpaid taxes while you were offline!");
+            player.sendMessage(ChatColor.RED + "You lost " + data.getTaxLostLands().size() + " lands due to unpaid taxes while you were offline!");
             data.getTaxLostLands().clear();
         }
-        
         if (!data.getRentalLostItems().isEmpty()) {
-            player.sendMessage(ChatColor.RED + "You lost " + data.getRentalLostItems().size() + 
-                    " rentals due to payment failure while you were offline!");
+            player.sendMessage(ChatColor.RED + "You lost " + data.getRentalLostItems().size() + " rentals due to payment failure while you were offline!");
             data.getRentalLostItems().clear();
         }
     }
