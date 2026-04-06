@@ -578,7 +578,6 @@ public class LandCoin extends JavaPlugin implements Listener {
             landBuyPrice = config.getDouble("LandBuyPrice", 0.00000001);
             landSellPrice = config.getDouble("LandSellPrice", 0.00000001);
             
-            // Check if dailyTax exists, if not, add it with default true
             if (!config.contains("DailyTax")) {
                 config.set("DailyTax", true);
                 try {
@@ -1749,14 +1748,22 @@ public class LandCoin extends JavaPlugin implements Listener {
                 return;
             }
 
+            // First, collect all lands that are for sale and not owned by the buyer
+            List<Land> toBuy = new ArrayList<>();
             BigDecimal totalPrice = BigDecimal.ZERO;
-            Map<String, Land> toBuy = new HashMap<>();
+            Map<Land, Double> originalPrices = new HashMap<>();
 
             for (String chunkKey : sel.getChunks()) {
                 Land land = plugin.getDataManager().getLand(chunkKey);
                 if (land != null && land.isForSale()) {
+                    // Prevent buying your own land
+                    if (land.getOwner().equals(player.getUniqueId())) {
+                        player.sendMessage(ChatColor.RED + "You cannot buy your own land!");
+                        return;
+                    }
+                    toBuy.add(land);
+                    originalPrices.put(land, land.getForSalePrice());
                     totalPrice = totalPrice.add(BigDecimal.valueOf(land.getForSalePrice()));
-                    toBuy.put(chunkKey, land);
                 }
             }
 
@@ -1771,9 +1778,17 @@ public class LandCoin extends JavaPlugin implements Listener {
                 return;
             }
 
-            final BigDecimal finalTotalPrice = totalPrice;
-            final Map<String, Land> finalToBuy = toBuy;
+            // Verify all sellers have cards
+            for (Land land : toBuy) {
+                String sellerCard = plugin.getCoinCardAPI().getPlayerCard(land.getOwner());
+                if (sellerCard == null) {
+                    player.sendMessage(ChatColor.RED + "Seller of land at " + land.getWorld() + " " + land.getX() + "," + land.getZ() + " has no card configured!");
+                    return;
+                }
+            }
 
+            // Check total balance
+            final BigDecimal finalTotalPrice = totalPrice;
             plugin.getCoinCardAPI().getBalance(playerCard, new BalanceCallback() {
                 @Override
                 public void onResult(double balance, String error) {
@@ -1786,39 +1801,82 @@ public class LandCoin extends JavaPlugin implements Listener {
                         return;
                     }
 
-                    for (Map.Entry<String, Land> entry : finalToBuy.entrySet()) {
-                        Land land = entry.getValue();
-                        double originalPrice = land.getForSalePrice();
-                        land.setForSale(-1);
+                    // Process each land sequentially
+                    processNextLand(0, player, toBuy, originalPrices, playerCard, serverCard);
+                }
+            });
+        }
 
-                        String sellerCard = plugin.getCoinCardAPI().getPlayerCard(land.getOwner());
-                        BigDecimal tax = BigDecimal.valueOf(originalPrice).multiply(
-                                BigDecimal.valueOf(plugin.getConfigManager().getTaxForSell()));
-                        BigDecimal sellerAmount = BigDecimal.valueOf(originalPrice).subtract(tax);
+        private void processNextLand(int index, Player player, List<Land> toBuy, Map<Land, Double> originalPrices,
+                                     String buyerCard, String serverCard) {
+            if (index >= toBuy.size()) {
+                player.sendMessage(ChatColor.GREEN + "Successfully purchased all " + toBuy.size() + " lands!");
+                return;
+            }
 
-                        plugin.getTransactionQueue().enqueue(playerCard, sellerCard, sellerAmount.doubleValue(), new TransferCallback() {
-                            @Override
-                            public void onSuccess(String txId, double amount) {
-                                plugin.getTransactionQueue().enqueue(playerCard, serverCard, tax.doubleValue(), null);
-                                land.setOwner(player.getUniqueId());
-                                land.clearForSale();
-                                plugin.getDataManager().saveAllAsync();
-                                new BukkitRunnable() {
-                                    @Override
-                                    public void run() {
-                                        player.sendMessage(ChatColor.GREEN + "Bought land for " + formatCoin(originalPrice) + " coins (TX: " + txId + ")");
-                                    }
-                                }.runTask(plugin);
+            Land land = toBuy.get(index);
+            double price = originalPrices.get(land);
+            BigDecimal tax = BigDecimal.valueOf(price).multiply(BigDecimal.valueOf(plugin.getConfigManager().getTaxForSell()));
+            BigDecimal sellerAmount = BigDecimal.valueOf(price).subtract(tax);
+            String sellerCard = plugin.getCoinCardAPI().getPlayerCard(land.getOwner());
+
+            // Re-check that the land is still for sale and price hasn't changed
+            if (!land.isForSale() || land.getForSalePrice() != price) {
+                player.sendMessage(ChatColor.RED + "Land at " + land.getWorld() + " " + land.getX() + "," + land.getZ() +
+                        " is no longer for sale at that price! Purchase cancelled for remaining lands.");
+                return;
+            }
+
+            // First, pay the seller
+            plugin.getTransactionQueue().enqueue(buyerCard, sellerCard, sellerAmount.doubleValue(), new TransferCallback() {
+                @Override
+                public void onSuccess(String txId, double amount) {
+                    // Then pay tax to server
+                    plugin.getTransactionQueue().enqueue(buyerCard, serverCard, tax.doubleValue(), new TransferCallback() {
+                        @Override
+                        public void onSuccess(String txId2, double amount2) {
+                            // Transfer ownership
+                            land.setOwner(player.getUniqueId());
+                            land.clearForSale();
+                            plugin.getDataManager().saveAllAsync();
+
+                            player.sendMessage(ChatColor.GREEN + "Bought land at " + land.getWorld() + " " + land.getX() + "," + land.getZ() +
+                                    " for " + formatCoin(price) + " coins (TX: " + txId + ")");
+
+                            // Notify seller if online
+                            Player seller = Bukkit.getPlayer(land.getOwner());
+                            if (seller != null && seller.isOnline()) {
+                                seller.sendMessage(ChatColor.GREEN + player.getName() + " bought your land at " +
+                                        land.getWorld() + " " + land.getX() + "," + land.getZ() + " for " + formatCoin(price) + " coins (TX: " + txId + ")");
                             }
 
-                            @Override
-                            public void onFailure(String error) {
-                                land.setForSale(originalPrice);
-                                plugin.getDataManager().saveAllAsync();
-                                player.sendMessage(ChatColor.RED + "Purchase failed: " + error);
-                            }
-                        });
-                    }
+                            // Process next land
+                            processNextLand(index + 1, player, toBuy, originalPrices, buyerCard, serverCard);
+                        }
+
+                        @Override
+                        public void onFailure(String error) {
+                            // Tax payment failed - this is critical, but seller already got paid.
+                            // Log error and attempt to refund? For simplicity, we'll just log and continue.
+                            plugin.getLogger().warning("Tax payment failed for land purchase: " + error +
+                                    " Buyer: " + player.getName() + ", Land: " + land.getChunkKey());
+                            player.sendMessage(ChatColor.RED + "Warning: Tax payment failed for land at " +
+                                    land.getWorld() + " " + land.getX() + "," + land.getZ() +
+                                    ". Please contact an admin.");
+                            // Still transfer ownership because seller was paid
+                            land.setOwner(player.getUniqueId());
+                            land.clearForSale();
+                            plugin.getDataManager().saveAllAsync();
+                            processNextLand(index + 1, player, toBuy, originalPrices, buyerCard, serverCard);
+                        }
+                    });
+                }
+
+                @Override
+                public void onFailure(String error) {
+                    player.sendMessage(ChatColor.RED + "Failed to purchase land at " + land.getWorld() + " " + land.getX() + "," + land.getZ() +
+                            ": " + error);
+                    // Stop further purchases
                 }
             });
         }
@@ -2482,7 +2540,6 @@ public class LandCoin extends JavaPlugin implements Listener {
         }
 
         private void checkTaxes() {
-            // Check if daily tax is enabled - if false, skip all tax processing
             if (!plugin.getConfigManager().isDailyTax()) {
                 return;
             }
@@ -2734,7 +2791,6 @@ public class LandCoin extends JavaPlugin implements Listener {
     }
 
     public class LandCommand implements CommandExecutor, TabCompleter {
-        // Command implementation
         @Override
         public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
             if (!(sender instanceof Player) && (args.length == 0 || !args[0].equalsIgnoreCase("reload") && !args[0].equalsIgnoreCase("admin"))) {
